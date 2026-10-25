@@ -1,0 +1,28 @@
+x68k - headless X68000 emulator for scripted / LLM play
+=======================================================
+
+Copyright (C) 2026 the x68k_headless contributors.
+License: GNU General Public License version 2 (see LICENSE).
+
+This program links the following third-party code:
+
+  px68k-libretro
+    Upstream: https://github.com/libretro/px68k-libretro
+    Commit:   0ad84d7058a12b7db4f7f7a906e87fad4e2f26f6
+    License:  GNU GPL v2 (third_party/px68k-libretro/COPYING)
+    px68k is originally by hissorii and NONAKA Kimihiro; the C68K CPU
+    core is derived from Yabause/C68K (Stephane Dallongeville).
+
+  fmgen
+    FM sound generator by cisc, included in px68k (fmgen/readme.txt).
+
+  libretro-common
+    Helper code shipped with px68k-libretro; see the file headers.
+
+NOT INCLUDED:
+
+  * X68000 ROM images (iplrom.dat, cgrom.dat) are copyrighted by SHARP and
+    are not part of this repository.
+  * Game disk images and HDD images are not part of this repository.
+
+You must supply ROMs and media you are legally entitled to use.
