@@ -86,6 +86,10 @@ uint16_t	VLINE_TOTAL = 567;
 uint32_t	VLINE = 0;
 uint32_t	vline = 0;
 
+/* x68k_headless patch: accessors for VGM timing. */
+uint32_t x68k_headless_vline(void) { return vline; }
+uint16_t x68k_headless_vline_total(void) { return VLINE_TOTAL; }
+
 #define SOUNDRATE 44100.0
 #define SNDSZ round(SOUNDRATE / FRAMERATE)
 

@@ -9,6 +9,7 @@
 #include "util.h"
 
 typedef struct recorder recorder;
+typedef struct vgm_recorder vgm_recorder;
 typedef struct emu emu;
 
 typedef enum {
@@ -86,5 +87,7 @@ unsigned emu_mouse_buttons(const emu *e);
 
 void     emu_set_recorder(emu *e, recorder *r);
 recorder *emu_get_recorder(const emu *e);
+void     emu_set_vgm(emu *e, vgm_recorder *v);
+vgm_recorder *emu_get_vgm(const emu *e);
 
 #endif

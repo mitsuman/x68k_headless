@@ -12,6 +12,9 @@ extern "C" {
 
 #include "opm.h"
 #include "opna.h"
+
+/* x68k_headless patch: optional VGM logger hook. */
+void (*x68k_opm_write_hook)(uint8_t reg, uint8_t data) = NULL;
 };
 
 class MyOPM : public FM::OPM
@@ -28,14 +31,30 @@ private:
 public:
 	int CurReg;
 	uint32_t CurCount;
+	uint8_t Shadow[256];
+
+	void ClearShadow(void);
+	void DumpRegs(uint8_t *out);
 
 	int StateAction(StateMem *sm, int load, int data_only);
 };
 
 
+void MyOPM::ClearShadow(void)
+{
+	memset(Shadow, 0, sizeof(Shadow));
+	Shadow[0x19] = 0x80;	/* value set by FM::OPM::Reset() */
+}
+
+void MyOPM::DumpRegs(uint8_t *out)
+{
+	memcpy(out, Shadow, sizeof(Shadow));
+}
+
 MyOPM::MyOPM()
 {
 	CurReg = 0;
+	ClearShadow();
 }
 
 int MyOPM::StateAction(StateMem *sm, int load, int data_only)
@@ -62,6 +81,9 @@ void MyOPM::WriteIO(uint32_t adr, uint8_t data)
 			::ADPCM_SetClock((data>>5)&4);
 			::FDC_SetForceReady((data>>6)&1);
 		}
+		Shadow[CurReg & 0xff] = data;
+		if ( x68k_opm_write_hook )
+			x68k_opm_write_hook((uint8_t)CurReg, data);
 		SetReg((int)CurReg, (int)data);
 	}
 	else
@@ -111,7 +133,16 @@ void OPM_Cleanup(void)
 
 void OPM_Reset(void)
 {
-	if ( opm ) opm->Reset();
+	if ( opm ) {
+		opm->Reset();
+		opm->ClearShadow();
+	}
+}
+
+void OPM_GetRegs(uint8_t *out)
+{
+	if ( opm ) opm->DumpRegs(out);
+	else memset(out, 0, 256);
 }
 
 

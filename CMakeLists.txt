@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(x68k_headless VERSION 0.1.0 LANGUAGES C CXX)
+project(x68k_headless VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -110,6 +110,7 @@ add_executable(x68k
   src/recorder.c
   src/server.c
   src/util.c
+  src/vgm.c
 )
 target_include_directories(x68k PRIVATE src)
 target_compile_definitions(x68k PRIVATE X68K_VERSION="${PROJECT_VERSION}")

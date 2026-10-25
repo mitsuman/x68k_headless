@@ -23,6 +23,7 @@
 #include "log.h"
 #include "recorder.h"
 #include "util.h"
+#include "vgm.h"
 
 typedef struct {
     app_paths paths;
@@ -37,6 +38,7 @@ typedef struct {
     bool cfg_valid;
 
     recorder *rec;
+    vgm_recorder *vgm;
     char rec_path[X68K_PATH_MAX];
     uint64_t rec_start_frame;
     double rec_start_seconds;
@@ -122,8 +124,30 @@ static bool video_is_31k(server *s) {
 }
 
 static json *recording_obj(server *s) {
+    if (s->vgm) {
+        json *r = json_object();
+        json_set_str(r, "format", "vgm");
+        json_set_str(r, "path", vgm_path(s->vgm));
+        json_set_int(r, "frames", (int64_t)vgm_frames(s->vgm));
+        json_set_int(r, "samples", (int64_t)vgm_samples(s->vgm));
+        json_set_double(r, "seconds", vgm_seconds(s->vgm));
+        json_set_bool(r, "adpcm", vgm_has_adpcm(s->vgm));
+        json *chips = json_array();
+        json_add_str(chips, "YM2151");
+        if (vgm_has_adpcm(s->vgm)) json_add_str(chips, "MSM6258");
+        json_set(r, "chips", chips);
+        struct stat st;
+        if (stat(vgm_path(s->vgm), &st) == 0) json_set_int(r, "bytes", (int64_t)st.st_size);
+        char fmsg[1024];
+        if (vgm_failed(s->vgm, fmsg, sizeof(fmsg))) {
+            json_set_bool(r, "failed", true);
+            json_set_str(r, "error", fmsg);
+        }
+        return r;
+    }
     if (!s->rec) return json_null();
     json *r = json_object();
+    json_set_str(r, "format", "mp4");
     json_set_str(r, "path", recorder_path(s->rec));
     json_set_double(r, "fps", recorder_fps(s->rec));
     json_set_int(r, "width", recorder_width(s->rec));
@@ -222,6 +246,13 @@ static void add_state(server *s, json *resp) {
 /* ------------------------------------------------------------------ */
 
 static void stop_machine(server *s) {
+    if (s->vgm) {
+        char err[2048] = {0};
+        if (s->machine) emu_set_vgm(s->machine, NULL);
+        if (vgm_stop(s->vgm, NULL, err, sizeof(err)) != 0)
+            xlog("VGM recording could not be finalised: %s", err);
+        s->vgm = NULL;
+    }
     if (s->rec) {
         char err[2048] = {0};
         if (s->machine) emu_set_recorder(s->machine, NULL);
@@ -284,6 +315,7 @@ static int finalize_recording(server *s, json *data) {
     s->rec_path[0] = '\0';
 
     json *info = json_object();
+    json_set_str(info, "format", "mp4");
     json_set_str(info, "path", path);
     json_set_int(info, "frames", (int64_t)frames);
     json_set_double(info, "fps", fps);
@@ -308,6 +340,57 @@ static int finalize_recording(server *s, json *data) {
         json_set(data, "error_detail", e);
         return -1;
     }
+    json_set(data, "recording", info);
+    return 0;
+}
+
+/* Called after anything that advances time.  A failed VGM write removes the
+ * partial file and reports a warning without stopping the machine. */
+static void check_vgm(server *s, json *data) {
+    if (!s->vgm) return;
+    char msg[1024];
+    if (!vgm_failed(s->vgm, msg, sizeof(msg))) return;
+    char path[X68K_PATH_MAX];
+    snprintf(path, sizeof(path), "%s", vgm_path(s->vgm));
+    if (s->machine) emu_set_vgm(s->machine, NULL);
+    char err[1024] = {0};
+    vgm_stop(s->vgm, NULL, err, sizeof(err));
+    s->vgm = NULL;
+    json *warn = json_object();
+    json_set_str(warn, "code", "recording_failed");
+    json_set_str(warn, "format", "vgm");
+    json_set_str(warn, "message", msg);
+    json_set_str(warn, "path", path);
+    json_set(data, "warning", warn);
+}
+
+static int finalize_vgm(server *s, json *data, char *errout, size_t errlen) {
+    if (!s->vgm) return -1;
+    char path[X68K_PATH_MAX];
+    snprintf(path, sizeof(path), "%s", vgm_path(s->vgm));
+    if (s->machine) emu_set_vgm(s->machine, NULL);
+    vgm_stats st;
+    memset(&st, 0, sizeof(st));
+    char err[2048] = {0};
+    int rc = vgm_stop(s->vgm, &st, err, sizeof(err));
+    s->vgm = NULL;
+    if (rc != 0) {
+        /* vgm_stop removed the incomplete file */
+        if (errout && errlen) snprintf(errout, errlen, "%s", err);
+        return -1;
+    }
+    json *info = json_object();
+    json_set_str(info, "format", "vgm");
+    json_set_str(info, "path", path);
+    json_set_int(info, "frames", (int64_t)st.frames);
+    json_set_int(info, "samples", (int64_t)st.samples);
+    json_set_double(info, "seconds", st.seconds);
+    json_set_int(info, "bytes", (int64_t)st.bytes);
+    json_set_bool(info, "adpcm", st.adpcm);
+    json *chips = json_array();
+    json_add_str(chips, "YM2151");
+    if (st.adpcm) json_add_str(chips, "MSM6258");
+    json_set(info, "chips", chips);
     json_set(data, "recording", info);
     return 0;
 }
@@ -424,16 +507,16 @@ static char *default_snap_path(server *s, int scale) {
     return path_join(s->paths.screens, name);
 }
 
-static char *default_record_path(server *s) {
+static char *default_record_path(server *s, const char *ext) {
     char ts[32];
     time_stamp(ts, sizeof(ts));
     char name[128];
-    snprintf(name, sizeof(name), "rec-%s.mp4", ts);
+    snprintf(name, sizeof(name), "rec-%s%s", ts, ext);
     char *p = path_join(s->paths.recordings, name);
     int n = 1;
     while (path_exists(p)) {
         free(p);
-        snprintf(name, sizeof(name), "rec-%s-%d.mp4", ts, n++);
+        snprintf(name, sizeof(name), "rec-%s-%d%s", ts, n++, ext);
         p = path_join(s->paths.recordings, name);
     }
     return p;
@@ -668,6 +751,8 @@ static json *cmd_step(server *s, int argc, char **argv, const char *cmdname) {
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
 
+    if (s->vgm) check_vgm(s, resp_data(resp));
+
     if (s->rec) check_recorder(s, resp_data(resp));
 
     emu_step_result st;
@@ -681,6 +766,7 @@ static json *cmd_step(server *s, int argc, char **argv, const char *cmdname) {
     s->last_speed = st.wall_ms > 0 ? st.emu_seconds / ((double)st.wall_ms / 1000.0) : 0.0;
 
     json *data = resp_data(resp);
+    if (s->vgm) check_vgm(s, data);
     if (s->rec) check_recorder(s, data);
     json_set_int(data, "frames", (int64_t)st.frames);
     if (is_frames) json_set_null(data, "requested_seconds");
@@ -790,6 +876,8 @@ static json *cmd_record(server *s, int argc, char **argv) {
     if (!strcmp(sub, "start")) {
         const char *out = NULL, *fps_s = NULL, *size_s = NULL;
         bool audio = true;
+        bool use_vgm = false;
+        bool vgm_adpcm = true;
         for (int i = 2; i < argc; i++) {
             const char *v = NULL;
             int m;
@@ -811,14 +899,47 @@ static json *cmd_record(server *s, int argc, char **argv) {
                 size_s = v; continue;
             }
             if (!strcmp(argv[i], "--no-audio")) { audio = false; continue; }
+            if (!strcmp(argv[i], "--vgm")) { use_vgm = true; continue; }
+            if (!strcmp(argv[i], "--no-adpcm") || !strcmp(argv[i], "--opm-only")) {
+                vgm_adpcm = false;
+                continue;
+            }
             return usage_error(resp, "unknown option for record start", argv[i]), resp;
         }
         if (!s->has_machine)
             return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
+        if (s->vgm) check_vgm(s, resp_data(resp));
         if (s->rec) check_recorder(s, resp_data(resp));
-        if (s->rec)
+        if (s->rec || s->vgm)
             return cmd_error(resp, "already_recording", "a recording is already in progress",
                              "run 'x68k record stop' first"), resp;
+
+        if (use_vgm) {
+            if (fps_s || size_s || !audio)
+                return usage_error(resp,
+                                   "--fps, --size and --no-audio are not used with --vgm",
+                                   "use '--vgm [--opm-only] [--out FILE.vgm]'"), resp;
+            char *vpath = out ? path_absolute(out) : default_record_path(s, ".vgm");
+            char verr[2048] = {0};
+            vgm_recorder *vr = vgm_start(vpath, vgm_adpcm, verr, sizeof(verr));
+            if (!vr) {
+                char msg[2200];
+                snprintf(msg, sizeof(msg), "%s", verr);
+                free(vpath);
+                return cmd_error(resp, "record_start_failed", msg, "check that the output path is writable"), resp;
+            }
+            s->vgm = vr;
+            emu_set_vgm(s->machine, vr);
+            json *vdata = resp_data(resp);
+            json_set(vdata, "recording", recording_obj(s));
+            json_set_str(vdata, "note",
+                         "VGM logs YM2151 register writes with scanline timing; ADPCM is queued at the MSM6258 rate. "
+                         "It records only emulated time advanced while recording.");
+            free(vpath);
+            set_ok(resp);
+            return resp;
+        }
+
         double fps = emu_fps(s->machine);
         if (fps_s) {
             errno = 0;
@@ -830,7 +951,7 @@ static json *cmd_record(server *s, int argc, char **argv) {
         unsigned w = 640, h = 480;
         if (size_s && !parse_size_arg(size_s, &w, &h))
             return usage_error(resp, "--size must be EVENxEVEN, e.g. 640x480", NULL), resp;
-        char *path = out ? path_absolute(out) : default_record_path(s);
+        char *path = out ? path_absolute(out) : default_record_path(s, ".mp4");
         char err[2048] = {0};
         recorder *r = recorder_start(path, fps, w, h, 44100, audio, err, sizeof(err));
         if (!r) {
@@ -854,6 +975,18 @@ static json *cmd_record(server *s, int argc, char **argv) {
     }
 
     if (!strcmp(sub, "stop")) {
+        if (s->vgm) {
+            json *data = resp_data(resp);
+            char verr[2048] = {0};
+            if (finalize_vgm(s, data, verr, sizeof(verr)) != 0) {
+                char msg[2200];
+                snprintf(msg, sizeof(msg), "%s", verr[0] ? verr : "the VGM recorder failed");
+                return cmd_error(resp, "recording_failed", msg,
+                                 "the incomplete VGM file was removed"), resp;
+            }
+            set_ok(resp);
+            return resp;
+        }
         if (!s->rec)
             return cmd_error(resp, "no_recording", "no recording is in progress", NULL), resp;
         json *data = resp_data(resp);
@@ -950,6 +1083,7 @@ static json *cmd_key(server *s, int argc, char **argv) {
 
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
+    if (s->vgm) check_vgm(s, resp_data(resp));
     if (s->rec) check_recorder(s, resp_data(resp));
 
     char err[512] = {0};
@@ -1026,6 +1160,7 @@ static json *cmd_key(server *s, int argc, char **argv) {
         json_set_double(data, "hold_seconds", hold_frames ? (double)hold_nframes / emu_fps(s->machine) : hold_sec);
         json_set_int(data, "frames", (int64_t)(st.frames + st2.frames));
         json_set_double(data, "emu_seconds", st.emu_seconds + st2.emu_seconds);
+        if (s->vgm) check_vgm(s, data);
         if (s->rec) check_recorder(s, data);
         set_ok(resp);
         return resp;
@@ -1098,6 +1233,7 @@ static json *cmd_key(server *s, int argc, char **argv) {
         json_set_int(data, "chars", (int64_t)dn);
         json_set_int(data, "frames", (int64_t)(emu_frame(s->machine) - f0));
         json_set_double(data, "emu_seconds", emu_seconds(s->machine) - s0);
+        if (s->vgm) check_vgm(s, data);
         if (s->rec) check_recorder(s, data);
         set_ok(resp);
         return resp;
@@ -1135,6 +1271,7 @@ static json *cmd_joy(server *s, int argc, char **argv) {
     }
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
+    if (s->vgm) check_vgm(s, resp_data(resp));
     if (s->rec) check_recorder(s, resp_data(resp));
     if (nb == 0) return usage_error(resp, "no buttons given", "example: x68k joy tap a"), resp;
 
@@ -1208,6 +1345,7 @@ static json *cmd_joy(server *s, int argc, char **argv) {
         json_set_int(data, "port", port);
         json_set_int(data, "frames", (int64_t)(st.frames + st2.frames));
         json_set_double(data, "emu_seconds", st.emu_seconds + st2.emu_seconds);
+        if (s->vgm) check_vgm(s, data);
         if (s->rec) check_recorder(s, data);
         set_ok(resp);
         return resp;
@@ -1237,6 +1375,7 @@ static json *cmd_mouse(server *s, int argc, char **argv) {
     }
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
+    if (s->vgm) check_vgm(s, resp_data(resp));
     if (s->rec) check_recorder(s, resp_data(resp));
     char err[512] = {0};
     json *data = resp_data(resp);
@@ -1282,6 +1421,7 @@ static json *cmd_mouse(server *s, int argc, char **argv) {
         json_set_str(data, "button", btn);
         json_set_int(data, "frames", (int64_t)(st.frames + st2.frames));
         json_set_double(data, "emu_seconds", st.emu_seconds + st2.emu_seconds);
+        if (s->vgm) check_vgm(s, data);
         if (s->rec) check_recorder(s, data);
         set_ok(resp);
         return resp;
@@ -1389,6 +1529,10 @@ static json *cmd_load(server *s, int argc, char **argv) {
     json *resp = new_response("load");
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
+    if (s->vgm)
+        return cmd_error(resp, "recording_active",
+                         "stop the VGM recording before loading a state",
+                         "run 'x68k record stop', then 'x68k load NAME'"), resp;
     if (argc < 2) return usage_error(resp, "load needs a state name", "example: x68k load state-00001234"), resp;
     const char *name = argv[1];
     if (!state_name_ok(name))
@@ -1451,6 +1595,10 @@ static json *cmd_reset(server *s) {
     json *resp = new_response("reset");
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
+    if (s->vgm)
+        return cmd_error(resp, "recording_active",
+                         "stop the VGM recording before resetting the machine",
+                         "run 'x68k record stop', then 'x68k reset'"), resp;
     emu_reset(s->machine);
     s->last_hash_valid = false;
     s->last_step_ms = 0;
@@ -1504,6 +1652,13 @@ static json *cmd_ping(server *s) {
 static json *cmd_quit(server *s) {
     json *resp = new_response("quit");
     json *data = resp_data(resp);
+    if (s->vgm) {
+        char verr[2048] = {0};
+        if (finalize_vgm(s, data, verr, sizeof(verr)) != 0) {
+            json_set_bool(data, "recording_finalize_failed", true);
+            if (verr[0]) json_set_str(data, "recording_finalize_error", verr);
+        }
+    }
     if (s->rec) {
         int rc = finalize_recording(s, data);
         if (rc != 0) json_set_bool(data, "recording_finalize_failed", true);

@@ -1,0 +1,14 @@
+PX68K libretro core
+===================
+Upstream: https://github.com/libretro/px68k-libretro
+Commit:   0ad84d7058a12b7db4f7f7a906e87fad4e2f26f6
+Vendored: 2026-10-25
+
+This directory is upstream source plus a small set of VGM logging hooks.
+See HEADLESS_PATCH.md for the exact local changes; emulation code is
+otherwise untouched.
+
+License: GNU GPL v2 (see COPYING).
+
+The emulator ROMs (iplrom.dat / cgrom.dat) are NOT included and must be
+supplied by the user.

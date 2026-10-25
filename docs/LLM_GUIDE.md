@@ -157,6 +157,29 @@ audio if your agent cannot watch video.
 
 To share a single frame instead, use `snap` or `step ... --snap`.
 
+### Recording the music as VGM
+
+If you want a chiptune-style sound log instead of a video, use `--vgm`:
+
+```sh
+x68k record start --vgm          # default: <home>/recordings/rec-<ts>.vgm
+x68k step 20s
+x68k record stop
+```
+
+The file is a standard VGM 1.61 log of the YM2151 (OPM) and, unless you pass
+`--opm-only`, the MSM6258 ADPCM. OPM writes are timestamped per scanline and
+the current OPM register state is written at the start, so you can begin in
+the middle of a song. Start the recording **before** the music starts if you
+want the ADPCM sample data; the position of a sample already playing cannot be
+recovered. `reset` and `load` return `recording_active` while a VGM is being
+recorded; stop it, change state, then start a new recording.
+
+`record stop` returns `format:"vgm"`, `samples`, `seconds`, `bytes`, `adpcm`
+and `chips`. Play the file with a VGM player (vgmplay) or render it with
+`vgm2wav --fade 0 in.vgm out.wav` (libvgm). The VGM and MP4 recorders are
+mutually exclusive.
+
 ## Recovering from errors
 
 Every error is JSON with a stable `error.code`, a human-readable `message`, an

@@ -17,6 +17,7 @@
 #include "log.h"
 #include "png.h"
 #include "recorder.h"
+#include "vgm.h"
 
 /* px68k internals we deliberately touch: only this flag, to make the core
  * publish its real refresh rate after the first boot frame. */
@@ -66,6 +67,7 @@ struct emu {
     size_t audio_len, audio_cap;
 
     recorder *rec;
+    vgm_recorder *vgm;
 
     int disk_drive;
     bool fdd_inserted[2];
@@ -535,9 +537,12 @@ bool emu_is_booted(const emu *e) { return e && e->booted; }
 static void run_one_frame(emu *e) {
     e->audio_len = 0;
     e->video_updated = false;
-    retro_run();
-    e->frame++;
     double fps = e->fps > 1.0 ? e->fps : 60.0;
+    if (e->vgm) vgm_begin_frame(e->vgm, fps);
+    retro_run();
+    if (e->vgm) vgm_end_frame(e->vgm);
+    e->frame++;
+    fps = e->fps > 1.0 ? e->fps : 60.0;
     e->seconds += 1.0 / fps;
 
     if (e->rec) {
@@ -1079,3 +1084,5 @@ void emu_av_info(emu *e, unsigned *w, unsigned *h, double *fps, double *sample_r
 
 void emu_set_recorder(emu *e, recorder *r) { if (e) e->rec = r; }
 recorder *emu_get_recorder(const emu *e) { return e ? e->rec : NULL; }
+void emu_set_vgm(emu *e, vgm_recorder *v) { if (e) e->vgm = v; }
+vgm_recorder *emu_get_vgm(const emu *e) { return e ? e->vgm : NULL; }

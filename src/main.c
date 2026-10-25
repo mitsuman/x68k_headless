@@ -42,8 +42,8 @@ static const char *HELP_TEXT =
     "  step --frames N [...same options]\n"
     "  snap [-o PATH] [--scale N]\n"
     "  record start [--out PATH] [--fps N] [--size WxH] [--no-audio]\n"
-    "  record stop\n"
-    "  record status\n"
+    "  record start --vgm [--out FILE.vgm] [--opm-only]\n"
+    "  record stop | record status\n"
     "  key tap|press <chord...> [--hold DUR]\n"
     "  key down|up <chord...>\n"
     "  key hold <DURATION> <chord...>\n"
@@ -80,6 +80,8 @@ static const char *HELP_TEXT =
     "  - Every command prints one JSON object on stdout. Exit codes: 0 = ok,\n"
     "    1 = command error, 2 = usage error, 3 = daemon error.\n"
     "  - 'x68k help keys' lists all key names.\n"
+    "  - 'record start --vgm' logs YM2151 (+ MSM6258 ADPCM) as a standard VGM\n"
+    "    file instead of an MP4; use --opm-only for a portable OPM-only log.\n"
     "\n"
     "Global --pretty/--compact may also be written after the command.\n";
 

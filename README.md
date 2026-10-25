@@ -56,6 +56,7 @@ LLM 向けの運用ガイドは [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) を参照
 * Dump the current screen as a PNG at native resolution (optional integer
   upscaling).
 * Start/stop recording of video + stereo audio to MP4 (H.264 + AAC).
+* VGM sound logs of the YM2151 (OPM) and MSM6258 ADPCM, for chiptune players.
 * Keyboard (including chords and text typing), relative mouse, and X68000
   joystick input; `tap`, `hold`, `down`/`up` variants.
 * Hot floppy swap with write-back to the image file.
@@ -68,8 +69,10 @@ LLM 向けの運用ガイドは [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) を参照
 
 * macOS (arm64/x86_64) or Linux; a C11/C++17 compiler and CMake ≥ 3.20.
 * zlib (a system library on both platforms).
-* `ffmpeg` and `ffprobe` on `PATH` **only for recording**. Everything else
+* `ffmpeg` and `ffprobe` on `PATH` **only for MP4 recording**. Everything else
   works without them.
+* Optional: a VGM player or converter such as `vgmplay` / `vgm2wav` (libvgm)
+  for the VGM output.
 * An X68000 ROM set (`iplrom.dat`, `cgrom.dat`) and disk images. **They are not
   included** (see [NOTICE](NOTICE)).
 
@@ -225,6 +228,38 @@ x68k record status
   is missing. `--size` must be even (yuv420p).
 * A recording that is still active when you `quit` or `boot` is finalized first.
 
+#### VGM sound logs
+
+```sh
+x68k record start --vgm [--out FILE.vgm] [--opm-only]
+x68k step 20s
+x68k record stop
+```
+
+`--vgm` records the sound chips instead of video: a standard VGM 1.61 stream
+with YM2151 (OPM) register writes at 4 MHz and, unless `--opm-only` is given,
+MSM6258 ADPCM data. The timeline is 44.1 kHz and the recorded duration is the
+emulated time spent inside `step`.
+
+* OPM writes are timestamped with the current scanline (about 1–2 VGM samples
+  of resolution). At record start the frontend dumps the current OPM register
+  state, so starting in the middle of a song works.
+* ADPCM bytes are queued and emitted at the MSM6258's current sample rate, so
+  players with a small sample FIFO receive them smoothly. The X68000's ADPCM
+  clock modes are selected with the libvgm/vgmplay MSM6258 clock registers;
+  use `--opm-only` for a log that avoids that extension.
+* Start the VGM **before** the music or PCM sample starts. The OPM state is
+  reconstructed, but the position of an already-playing ADPCM sample cannot
+  be.
+* `reset` and `load` are rejected while a VGM recording is active (the chips
+  change state without register writes). Stop the recording, change state,
+  then restart it.
+* Play it with `vgmplay file.vgm` or convert with
+  `vgm2wav --fade 0 file.vgm out.wav` (libvgm). A 20-second OPM-heavy segment
+  is typically 100–200 KB; ADPCM adds at most ~40 KB/s.
+* The VGM recorder and the MP4 recorder are mutually exclusive; `record stop`
+  finalizes whichever is active.
+
 ### Input
 
 ```sh
@@ -352,6 +387,8 @@ Every command prints exactly one JSON object. Success:
 }
 ```
 
+* `state.recording` is `null`, an MP4 object (`"format":"mp4"`), or a VGM
+  object (`"format":"vgm"`, with `samples`, `adpcm`, `chips`).
 * `state.screen.hash` is a 64-bit FNV-1a of the native framebuffer.
   `state.screen.changed` compares it with the screen at the previous command.
   This lets an agent wait for loading screens without fetching images.
@@ -393,6 +430,10 @@ and ffmpeg errors.
   floppy write-back and SRAM.
 * The emulated RTC follows the host clock; games that read it are not
   deterministic across wall-clock time.
+* VGM logs the OPM (and optionally the MSM6258). It does not include the
+  Mercury sound board (not compiled in). OPM playback works in any VGM player;
+  the 4 MHz ADPCM clock modes rely on the MSM6258 clock-register extension
+  implemented by libvgm/vgmplay.
 * `.hdf` is the only hard-disk format accepted by the core. If both an HDF and
   floppies are given, the HDF is the boot content and the floppies are inserted
   immediately after the core initializes.
@@ -423,8 +464,9 @@ python3 tests/smoke_test.py --bin build/x68k
 ```
 
 The test copies the images to a temporary session, boots, steps, snapshots,
-exercises all input paths, records and probes the MP4, swaps disks, runs a
-batch, resets and quits. It skips recording checks when ffmpeg is absent.
+exercises all input paths, records and probes the MP4, records and parses a
+VGM, swaps disks, runs a batch, resets and quits. It skips MP4 checks when
+ffmpeg is absent.
 
 ## Credits
 
@@ -432,3 +474,8 @@ px68k and px68k-libretro (hissorii, NONAKA Kimihiro, kenyahiro and
 contributors), the C68K CPU core (Stephane Dallongeville/Yabause), fmgen
 (cisc), and libretro-common. See [NOTICE](NOTICE) and
 `third_party/px68k-libretro/COPYING`.
+
+The vendored core carries a few small VGM logging hooks (OPM/ADPCM write
+callbacks, OPM register shadow, scanline accessors); see
+`third_party/px68k-libretro/HEADLESS_PATCH.md`. They do nothing unless a VGM
+recording is active.

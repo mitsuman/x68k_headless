@@ -10,6 +10,8 @@ This program links the following third-party code:
     Upstream: https://github.com/libretro/px68k-libretro
     Commit:   0ad84d7058a12b7db4f7f7a906e87fad4e2f26f6
     License:  GNU GPL v2 (third_party/px68k-libretro/COPYING)
+    Local changes: small VGM logging hooks, see
+    third_party/px68k-libretro/HEADLESS_PATCH.md
     px68k is originally by hissorii and NONAKA Kimihiro; the C68K CPU
     core is derived from Yabause/C68K (Stephane Dallongeville).
 

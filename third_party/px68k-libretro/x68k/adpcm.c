@@ -54,6 +54,12 @@ static int ADPCM_DifBuf = 0;
 
 static int ADPCM_Pan = 0x00;
 static int OldR = 0, OldL = 0;
+
+/* x68k_headless patch: optional VGM logger hooks. */
+void (*x68k_adpcm_write_hook)(uint32_t adr, uint8_t data) = NULL;
+void (*x68k_adpcm_clock_hook)(int mode) = NULL;
+int x68k_adpcm_clock_mode(void) { return ADPCM_Clock; }
+double x68k_adpcm_sample_rate(void) { return ADPCM_ClockRate / 12.0; }
 static int Outs[8];
 static int OutsIp[4];
 static int OutsIpR[4];
@@ -317,6 +323,8 @@ void FASTCALL ADPCM_Write(uint32_t adr, uint8_t data)
 {
 	if ( adr==0xe92001 )
    {
+      if ( x68k_adpcm_write_hook )
+         x68k_adpcm_write_hook(adr, data);
       if ( data&1 )
          ADPCM_Playing = 0;
       else if ( data&2 )
@@ -335,6 +343,8 @@ void FASTCALL ADPCM_Write(uint32_t adr, uint8_t data)
    {
 		if ( ADPCM_Playing )
       {
+         if ( x68k_adpcm_write_hook )
+            x68k_adpcm_write_hook(adr, data);
          ADPCM_WriteOne((uint8_t)(data & 15));
          ADPCM_WriteOne((uint8_t)((data >> 4) & 15));
       }
@@ -365,6 +375,8 @@ void ADPCM_SetPan(int n)
 		ADPCM_Count     = 0;
 		ADPCM_Clock     = (ADPCM_Clock&4)|((n>>2)&3);
 		ADPCM_ClockRate = ADPCM_Clocks[ADPCM_Clock];
+		if ( x68k_adpcm_clock_hook )
+			x68k_adpcm_clock_hook(ADPCM_Clock);
 	}
 	ADPCM_Pan = n;
 }
@@ -376,6 +388,8 @@ void ADPCM_SetClock(int n)
 		ADPCM_Count     = 0;
 		ADPCM_Clock     = n | ((ADPCM_Pan>>2)&3);
 		ADPCM_ClockRate = ADPCM_Clocks[ADPCM_Clock];
+		if ( x68k_adpcm_clock_hook )
+			x68k_adpcm_clock_hook(ADPCM_Clock);
 	}
 }
 

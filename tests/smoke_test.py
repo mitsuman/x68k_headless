@@ -216,6 +216,84 @@ def main():
         else:
             info("ffmpeg not found: skipping recording tests")
 
+        print("== VGM recording")
+        vgm = os.path.join(tmp, "test.vgm")
+        rc, j, _, _, err = run(binary, home, "record", "start", "--vgm", "--out", vgm)
+        check(rc == 0 and j and j.get("ok") and j["data"]["recording"]["format"] == "vgm",
+              "record start --vgm", err)
+        rc, j, _, _, _ = run(binary, home, "step", "0.5s")
+        rc, j, _, _, err = run(binary, home, "record", "stop")
+        check(rc == 0 and j and j.get("ok") and j["data"]["recording"]["samples"] > 0,
+              "record stop (vgm)", err)
+        check(os.path.isfile(vgm), "VGM file exists")
+        if os.path.isfile(vgm):
+            d = open(vgm, "rb").read()
+            ok_magic = d[:4] == b"Vgm "
+            ver = int.from_bytes(d[8:12], "little")
+            total = int.from_bytes(d[0x18:0x1c], "little")
+            ym = int.from_bytes(d[0x30:0x34], "little")
+            msm = int.from_bytes(d[0x90:0x94], "little")
+            check(ok_magic and ver == 0x161 and total > 0 and ym == 4000000
+                  and msm == 8000000 and d[0x94] == 0x06,
+                  "VGM header (magic/version/samples/clocks/ADPCM flags)")
+            # Walk the command stream to the end marker.
+            o = 0x34 + int.from_bytes(d[0x34:0x38], "little")
+            wait = 0
+            ops = 0
+            ok = False
+            while o < len(d):
+                c = d[o]
+                if c == 0x54:
+                    ops += 1; o += 3
+                elif c == 0xb7:
+                    o += 3
+                elif c == 0x61:
+                    wait += d[o+1] | (d[o+2] << 8); o += 3
+                elif c == 0x62:
+                    wait += 735; o += 1
+                elif c == 0x63:
+                    wait += 882; o += 1
+                elif 0x70 <= c <= 0x7f:
+                    wait += (c - 0x70) + 1; o += 1
+                elif c == 0x66:
+                    o += 1; ok = True; break
+                else:
+                    break
+            check(ok and wait == total and ops > 0,
+                  f"VGM stream (OPM writes={ops}, waits={wait}, total={total})")
+
+        vgm_opm = os.path.join(tmp, "opm_only.vgm")
+        rc, j, _, _, _ = run(binary, home, "record", "start", "--vgm", "--opm-only", "--out", vgm_opm)
+        check(rc == 0 and j and j.get("ok"), "record start --vgm --opm-only")
+        rc, j, _, _, _ = run(binary, home, "reset")
+        check(rc == 1 and j and j.get("error", {}).get("code") == "recording_active",
+              "reset while VGM recording -> recording_active")
+        rc, j, _, _, _ = run(binary, home, "load", "smoke1")
+        check(rc == 1 and j and j.get("error", {}).get("code") == "recording_active",
+              "load while VGM recording -> recording_active")
+        rc, j, _, _, _ = run(binary, home, "step", "0.3s")
+        rc, j, _, _, _ = run(binary, home, "record", "stop")
+        check(rc == 0 and os.path.isfile(vgm_opm), "OPM-only VGM finalised")
+        if os.path.isfile(vgm_opm):
+            d = open(vgm_opm, "rb").read()
+            msm = int.from_bytes(d[0x90:0x94], "little")
+            flags = d[0x94]
+            o = 0x34 + int.from_bytes(d[0x34:0x38], "little")
+            b7 = 0
+            while o < len(d):
+                c = d[o]
+                if c == 0x54 or c == 0x61 or c == 0xb7:
+                    if c == 0xb7:
+                        b7 += 1
+                    o += 3
+                elif c in (0x62, 0x63) or 0x70 <= c <= 0x7F:
+                    o += 1
+                elif c == 0x66:
+                    break
+                else:
+                    break
+            check(msm == 0 and flags == 0 and b7 == 0, "OPM-only VGM has no MSM6258 commands")
+
         print("== batch")
         script = os.path.join(tmp, "commands.txt")
         with open(script, "w") as f:
