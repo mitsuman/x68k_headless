@@ -259,8 +259,10 @@ def main():
                     o += 1; ok = True; break
                 else:
                     break
-            check(ok and wait == total and ops > 0,
-                  f"VGM stream (OPM writes={ops}, waits={wait}, total={total})")
+            # 256 writes are the initial register dump; at least one more
+            # means the live OPM write hook is actually connected.
+            check(ok and wait == total and ops > 256,
+                  f"VGM stream (OPM writes={ops} incl. 256-reg dump, waits={wait}, total={total})")
 
         vgm_opm = os.path.join(tmp, "opm_only.vgm")
         rc, j, _, _, _ = run(binary, home, "record", "start", "--vgm", "--opm-only", "--out", vgm_opm)
