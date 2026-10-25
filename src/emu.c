@@ -169,7 +169,13 @@ static bool env_cb(unsigned cmd, void *data) {
         else if (!strcmp(key, "px68k_vbtn_swap")) val = "TRIG2 TRIG1";
         else if (!strcmp(key, "px68k_analog")) val = "disabled";
         else if (!strcmp(key, "px68k_rumble_on_disk_read")) val = "disabled";
-        else if (!strcmp(key, "px68k_midi_output")) val = "disabled";
+        /* Keep the CZ-6BM1 MIDI UART mapped even though we never emit
+         * host MIDI.  Z-MUSIC (ZMSC.X) probes its Tx-ready bit while the
+         * driver initialises; with the board absent (MIDI_SW=0) that read
+         * returns 0 and the guest spins forever at the ZMUSIC banner.
+         * The frontend does not expose RETRO_ENVIRONMENT_GET_MIDI_INTERFACE,
+         * so the core's midi_out_open() fails and all output is dropped. */
+        else if (!strcmp(key, "px68k_midi_output")) val = "enabled";
         else if (!strcmp(key, "px68k_midi_output_type")) val = "GM";
         else if (!strcmp(key, "px68k_opm_vol")) val = "12";
         else if (!strcmp(key, "px68k_adpcm_vol")) val = "15";
