@@ -55,6 +55,7 @@ set(PX68K_C_SOURCES
   ${PX68K_DIR}/libretro/fake.c
   ${PX68K_DIR}/libretro/peace.c
   ${PX68K_DIR}/libretro/state.c
+  ${PX68K_DIR}/libretro-common/compat/compat_strl.c
   ${PX68K_DIR}/libretro-common/string/stdstring.c
 )
 
