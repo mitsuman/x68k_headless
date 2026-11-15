@@ -15,6 +15,7 @@ typedef struct {
     char screens[X68K_PATH_MAX];
     char recordings[X68K_PATH_MAX];
     char states[X68K_PATH_MAX];
+    char dumps[X68K_PATH_MAX];
     char roms[X68K_PATH_MAX];
 } app_paths;
 

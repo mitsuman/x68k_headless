@@ -1,8 +1,8 @@
 # Local changes for x68k_headless
 
 This vendored px68k-libretro tree contains a few additions used by the
-x68k_headless VGM logger.  They are inert unless a VGM recording is active and
-do not change emulation behaviour.
+x68k_headless frontend (VGM logger and PCG/palette dump).  They are read-only
+hooks or accessors and do not change emulation behaviour.
 
 ## `fmgen/fmg_wrap.cpp`, `fmgen/fmg_wrap.h`
 
@@ -29,5 +29,16 @@ do not change emulation behaviour.
   `uint16_t x68k_headless_vline_total(void)` expose the current scanline and
   frame line count for the VGM timing.  (`vline` is renamed to `HOGEvline` by
   `libretro/winx68k.h`, so the accessors avoid relying on the macro.)
+
+## `x68k/bg.c`, `x68k/bg.h`
+
+* `const uint8_t *BG_GetPCG16(void)` / `BG_GetPCG8(void)` expose the expanded
+  character patterns (`BGCHR16` / `BGCHR8`, one palette index per byte,
+  pattern-major) for the `dump` command.
+* `int BG_GetCHRSize(void)` reports the active 8/16-dot BG character size.
+* `int BG_GetSprite(int, uint16_t *x, uint16_t *y, uint16_t *ctrl,
+  uint8_t *priority)` decodes one of the 128 sprite attribute entries.
+* `Sprite_Regs` is declared in `bg.h`; `BGCHR16`/`BGCHR8` stay private and are
+  only reachable through the read-only accessors.
 
 No other source changes are made.

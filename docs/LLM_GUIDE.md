@@ -10,9 +10,10 @@ you ask for it**, and every command returns JSON.
 * `x68k step 2s` advances **emulated** time as fast as the host allows. A step
   is normally a fraction of a second of wall time.
 * Screenshots are PNG files; the command returns a path. Videos are MP4 files.
-* Input commands either change state instantly (`key down`, `mouse move`) or
+* Input commands either change state instantly (`key down`, `mouse down`) or
   change state *and* advance time (`key tap`, `key hold`, `joy hold`,
-  `mouse click`, `key type`).
+  `mouse move`, `mouse click`, `mouse doubleclick`, `key type`).
+  `mouse move --no-wait` is the instant variant.
 * A 55–61 Hz X68000 frame is roughly 16–18 ms. Durations are rounded up to a
   frame; trust the returned `data.frames` / `data.emu_seconds`.
 
@@ -33,7 +34,9 @@ you ask for it**, and every command returns JSON.
    x68k key tap return           # menus / confirmations
    x68k joy hold 1s right        # movement in a game
    x68k key hold 500ms space     # keyboard-controlled games
-   x68k mouse click left         # point-and-click games
+   x68k mouse move 20 -5         # relative; waits for the guest
+   x68k mouse click left         # single click
+   x68k mouse doubleclick left   # open a desktop icon
    ```
 4. **Repeat** from step 2. Add `--snap` to any `step` to observe the result in
    one round trip.
@@ -71,7 +74,8 @@ you ask for it**, and every command returns JSON.
 | Action game using the joypad | `joy hold 1s right`, `joy tap a` |
 | Action game using the keyboard | `key hold 500ms z` |
 | Text prompt / BASIC / Human68k shell | `key type "DIR\n"` |
-| Point-and-click / mouse-driven UI | `mouse move 20 -5` then `step 0.1s`, `mouse click left` |
+| Point-and-click / mouse-driven UI | `mouse move 20 -5`, then `mouse click left` |
+| Open a desktop icon / list item | `mouse doubleclick left` |
 | Skip an intro | `key tap esc` or `key tap return` repeatedly |
 | Multi-button action | `joy hold 300ms left+a` |
 
@@ -83,9 +87,14 @@ Notes:
   ignored. `key down` + `step` + `key up` gives frame-level control.
 * `key type` advances time per character and can be slow (roughly 10 chars/s of
   emulated time). It handles uppercase, punctuation and `\n` automatically.
-* Mouse movement is relative and is delivered over the next frames. After a
-  large `mouse move`, run `step 0.2s` before clicking; the guest must process
-  the motion before the click.
+* Mouse movement is relative. `mouse move` advances emulated time until the
+  guest has consumed the whole delta, so no extra `step` is needed before a
+  click. It feeds one unit per frame to avoid the guest's pointer acceleration
+  (a 100 px move costs about 100 frames). Use `--no-wait` only when you want to
+  combine the move with your own `step`.
+* `mouse click` is a single click; `mouse doubleclick` clicks twice with a
+  100 ms gap by default (`--hold`, `--interval`). Both first deliver any queued
+  movement, then click at the current pointer position.
 * Chords use `+`: `key tap ctrl+s`, `key tap shift+up`. For the `+` key itself
   use `plus`.
 
@@ -143,17 +152,30 @@ x68k step 0.1s --snap     # render the restored screen
 ## Recording for review
 
 ```sh
-x68k record start --size 640x480
+x68k record start            # default: fixed 1600x1024 canvas
 x68k joy hold 2s right
 x68k step 3s
 x68k record stop
 ```
 
-`record stop` returns `data.recording` with `path`, `frames`, `fps`,
+Every frame is resampled into a centred 4:3 rectangle (1364×1024 in the default
+canvas, black bars at the sides) with Lanczos-3 when upscaling and an area
+filter when downscaling. The canvas never changes, so a mode switch does not
+alter the geometry. `--size WxH` (even values) picks a different canvas.
+
+`record stop` returns `data.recording` with `path`, `width`, `height`,
+`source_width`, `source_height`, `resolution_changes`, `frames`, `fps`,
 `video_seconds`, `emu_seconds`, `bytes` and codec information. Recordings are
 real-time in **emulated** time: 10 seconds of stepping produces a ~10-second
 file, regardless of how fast the host ran. `ffprobe` can extract frames or
-audio if your agent cannot watch video.
+audio if your agent cannot watch video. Recording at 1600×1024 is roughly 2x
+slower than real time.
+
+If the game changes video mode while recording, check `data.warning` in the
+response of the step that crossed the switch (`code:
+"recording_resolution_changed"`, with `from` / `to`) and
+`state.recording.resolution_changes`. It is informational: the canvas and the
+4:3 framing stay the same.
 
 To share a single frame instead, use `snap` or `step ... --snap`.
 
@@ -180,6 +202,37 @@ and `chips`. Play the file with a VGM player (vgmplay) or render it with
 `vgm2wav --fade 0 in.vgm out.wav` (libvgm). The VGM and MP4 recorders are
 mutually exclusive.
 
+## Inspecting PCG and palettes
+
+`dump` extracts the sprite/BG character patterns and palette state at the
+current frame. It does not advance time, so run it when the screen looks
+interesting:
+
+```sh
+x68k dump
+# -> data.dir = <home>/dumps/f00000667
+#    pcg16.png / pcg16.bin, pcg8.png / pcg8.bin
+#    palette.json / palette.bin, video.json
+```
+
+* `pcg16.*` contains 256 **16×16, 16-colour** patterns (the PCG used by
+  sprites and BG); `pcg8.*` is the 256-pattern 8×8 BG set. The PNG is a
+  16-column contact sheet; the BIN is pattern-major, one byte per pixel
+  (0–15), 65,536 / 16,384 bytes.
+* `palette.json` has 256 graphics and 256 text/sprite/BG entries. Each entry
+  includes the raw 16-bit `0xGRBI` value, RGB565 and `#rrggbb`. `palette.bin`
+  is the raw 1024-byte register image.
+* `video.json` lists BG registers/scroll, all 128 sprite attributes (x, y,
+  control word, pattern, palette bank, priority), CRTC/text registers and
+  graphic scroll values.
+* Use `--bank 0..15` to render the preview with a different text palette bank,
+  `--scale 1..8` to enlarge it, `--grid` to separate tiles, and
+  `--out DIR` to choose another directory.
+
+An all-zero `pcg16.bin` can be normal: many X68000 games compose the whole
+screen in GVRAM and never use hardware sprites/BG. If sprites are active,
+`video.json` shows which pattern/bank each one uses.
+
 ## Recovering from errors
 
 Every error is JSON with a stable `error.code`, a human-readable `message`, an
@@ -192,6 +245,7 @@ optional `hint`, and an `exit` code. Common cases:
 | `media_missing` / `bad_media` | Check the image path/extension; run `x68k doctor`. |
 | `usage` | Bad argument. Read `hint`; `x68k help`, `x68k help keys`. |
 | `no_frame` | Advance at least one frame before snapping. |
+| `dump_failed` | Check the output directory/permissions; the message names the file. |
 | `recording_failed` | Read `message`; ffmpeg may have died or the disk is full. |
 | `daemon_unavailable` | The daemon failed to start; the error includes the log tail. |
 
@@ -210,6 +264,8 @@ new one (the machine state is lost).
   printf 'step 1s\njoy hold 2s right\nstep 1s --snap\n' | x68k batch
   ```
   Each result embeds the full response, so verify the final `all_ok`.
+* `dump` writes files. The response inlines the palettes (about 10 KB); read
+  `palette.json`/`video.json` and the PCG images only when you need them.
 * Use `x68k help keys` once and keep the list; do not call it repeatedly.
 
 ## Suggested system prompt
@@ -230,7 +286,8 @@ You can paste this into an agent's instructions:
 > Use `joy hold <duration> <direction>` to move, `joy tap a` or
 > `key tap return` to confirm, `key tap esc` to back out, and
 > `key type "TEXT\n"` for text prompts. Mouse input is relative:
-> `mouse move DX DY`, then `step 0.1s`, then `mouse click left`.
+> `mouse move DX DY`, then `mouse click left` (or `mouse doubleclick left`
+> for icons). `mouse move` already waits for the guest to consume the motion.
 >
 > If an action has no visible effect, try a longer hold, a different button,
 > or wait 1–3 seconds. If an error returns, read `error.code` and `hint` and

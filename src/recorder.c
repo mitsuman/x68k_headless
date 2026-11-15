@@ -18,6 +18,98 @@
 
 extern char **environ;
 
+/* The X68000 drives a 4:3 display in every video mode (15 kHz and 31 kHz), so
+ * a recording normalises each frame into a 4:3 rectangle inside the output
+ * canvas.  Dots are not square, so the two axes are scaled independently. */
+#define REC_ASPECT_NUM 4.0
+#define REC_ASPECT_DEN 3.0
+
+/* Separable resampling table: for each destination sample, which source
+ * samples contribute and with what (normalised) weight.  Upscaling uses a
+ * Lanczos-3 kernel, downscaling an area/box filter. */
+typedef struct {
+    int n;          /* destination samples */
+    int max_taps;
+    int *first;     /* [n] first source index */
+    int *count;     /* [n] number of taps */
+    float *weight;  /* [n * max_taps] */
+    unsigned src_n; /* source samples the table was built for */
+} tap_table;
+
+static double lanczos3(double x) {
+    if (x == 0.0) return 1.0;
+    if (x < -3.0 || x > 3.0) return 0.0;
+    double px = M_PI * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+static void tap_table_free(tap_table *t) {
+    free(t->first);
+    free(t->count);
+    free(t->weight);
+    memset(t, 0, sizeof(*t));
+}
+
+static int tap_table_build(tap_table *t, unsigned dst_n, unsigned src_n) {
+    if (!dst_n || !src_n) return -1;
+    tap_table_free(t);
+    double scale = (double)src_n / (double)dst_n;
+    bool down = scale > 1.0;
+    int max_taps = down ? (int)ceil(scale) + 2 : 7;
+    if (max_taps < 2) max_taps = 2;
+    if (max_taps > 64) max_taps = 64;
+    t->n = (int)dst_n;
+    t->src_n = src_n;
+    t->max_taps = max_taps;
+    t->first = xmalloc(sizeof(int) * dst_n);
+    t->count = xmalloc(sizeof(int) * dst_n);
+    t->weight = xmalloc(sizeof(float) * (size_t)dst_n * (size_t)max_taps);
+    for (unsigned d = 0; d < dst_n; d++) {
+        double center = ((double)d + 0.5) * scale - 0.5;
+        int lo, hi;
+        if (down) {
+            double a = (double)d * scale;
+            double b = a + scale;
+            lo = (int)floor(a);
+            hi = (int)ceil(b) - 1;
+        } else {
+            lo = (int)floor(center - 3.0) + 1;
+            hi = (int)ceil(center + 3.0) - 1;
+        }
+        if (lo < 0) lo = 0;
+        if (hi > (int)src_n - 1) hi = (int)src_n - 1;
+        if (hi < lo) hi = lo;
+        if (hi - lo + 1 > max_taps) hi = lo + max_taps - 1;
+        int n = hi - lo + 1;
+        float *w = t->weight + (size_t)d * (size_t)max_taps;
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) {
+            int sx = lo + i;
+            double v;
+            if (down) {
+                double a = (double)d * scale;
+                double b = a + scale;
+                double l = a > (double)sx ? a : (double)sx;
+                double r = b < (double)sx + 1.0 ? b : (double)sx + 1.0;
+                v = r > l ? (r - l) / scale : 0.0;
+            } else {
+                v = lanczos3((double)sx - center);
+            }
+            w[i] = (float)v;
+            sum += v;
+        }
+        if (sum <= 1e-9) {
+            w[0] = 1.0f;
+            n = 1;
+            sum = 1.0;
+        }
+        for (int i = 0; i < n; i++) w[i] = (float)(w[i] / sum);
+        t->first[d] = lo;
+        t->count[d] = n;
+    }
+    return 0;
+}
+
 struct recorder {
     char out_path[X68K_PATH_MAX];
     char video_tmp[X68K_PATH_MAX];
@@ -37,8 +129,23 @@ struct recorder {
     double video_acc;
 
     uint8_t *canvas;
-    unsigned *xmap;
-    unsigned xmap_src_w;
+
+    /* Aspect-locked content rectangle inside the canvas.  Fixed for the whole
+     * recording, so a mid-recording mode switch cannot change the geometry. */
+    unsigned content_w, content_h, content_x, content_y;
+
+    tap_table xt, yt;      /* horizontal / vertical resampling tables */
+    unsigned map_src_w, map_src_h;
+    float *hbuf;           /* planar RGB rows after the horizontal pass */
+    size_t hbuf_floats;
+    float *vrow;           /* vertical accumulation row (3 planes) */
+    size_t vrow_floats;
+
+    /* Emulated screen size tracking.  The output size is fixed at start, so a
+     * mode switch mid-recording means later frames are rescaled. */
+    unsigned src_w, src_h;
+    unsigned res_from_w, res_from_h, res_to_w, res_to_h;
+    uint64_t res_changes, res_seq;
 
     bool failed;
     char fail_msg[2048];
@@ -158,7 +265,8 @@ recorder *recorder_start(const char *out_path, double fps, unsigned width, unsig
         return NULL;
     }
     if (width < 16 || height < 16 || (width & 1) || (height & 1)) {
-        snprintf(err, errlen, "recording size must be even and at least 16x16");
+        snprintf(err, errlen,
+                 "recording size %ux%u must be even and at least 16x16", width, height);
         return NULL;
     }
     char *dir = path_dirname(out_path);
@@ -232,40 +340,109 @@ recorder *recorder_start(const char *out_path, double fps, unsigned width, unsig
     }
 
     r->canvas = xmalloc((size_t)width * height * 3);
-    xlog("recording started: %s (%ux%u @ %.3f fps, audio=%s)", out_path, width, height, fps,
-         audio ? "yes" : "no");
+    memset(r->canvas, 0, (size_t)width * height * 3);
+
+    /* Fit a 4:3 image into the canvas, centred, leaving black bars.  The
+     * rectangle never changes, so mode switches keep the same geometry. */
+    r->content_h = height;
+    r->content_w = (unsigned)lround((double)height * REC_ASPECT_NUM / REC_ASPECT_DEN);
+    if (r->content_w > width) {
+        r->content_w = width;
+        r->content_h = (unsigned)lround((double)width * REC_ASPECT_DEN / REC_ASPECT_NUM);
+    }
+    r->content_w &= ~1u;
+    r->content_h &= ~1u;
+    if (r->content_w < 2) r->content_w = 2;
+    if (r->content_h < 2) r->content_h = 2;
+    r->content_x = (width - r->content_w) / 2;
+    r->content_y = (height - r->content_h) / 2;
+
+    xlog("recording started: %s (%ux%u canvas, %ux%u 4:3 image @ %.3f fps, audio=%s)",
+         out_path, width, height, r->content_w, r->content_h, fps, audio ? "yes" : "no");
     return r;
 }
 
-static void convert_frame(recorder *r, const uint16_t *src, unsigned sw, unsigned sh, size_t pitch) {
-    size_t out_stride = (size_t)r->width * 3;
-    if (!src || !sw || !sh) {
-        memset(r->canvas, 0, out_stride * r->height);
-        return;
+static uint8_t clamp8(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 255.0f) return 255;
+    return (uint8_t)(v + 0.5f);
+}
+
+/* Resample one emulated frame into the fixed 4:3 content rectangle using the
+ * separable Lanczos-3 (upscale) / area (downscale) tables. */
+static void scale_frame(recorder *r, const uint16_t *src, unsigned sw, unsigned sh, size_t pitch) {
+    unsigned cw = r->content_w, ch = r->content_h;
+    if (!cw || !ch) return;
+    if (r->map_src_w != sw || r->map_src_h != sh) {
+        if (tap_table_build(&r->xt, cw, sw) != 0) return;
+        if (tap_table_build(&r->yt, ch, sh) != 0) return;
+        r->map_src_w = sw;
+        r->map_src_h = sh;
     }
-    if (r->xmap_src_w != sw) {
-        free(r->xmap);
-        r->xmap = xmalloc(sizeof(unsigned) * r->width);
-        for (unsigned x = 0; x < r->width; x++) {
-            uint64_t sx = (uint64_t)x * sw / r->width;
-            if (sx >= sw) sx = sw - 1;
-            r->xmap[x] = (unsigned)sx;
+    if (!r->hbuf || r->hbuf_floats < (size_t)cw * sh * 3) {
+        free(r->hbuf);
+        r->hbuf = xmalloc(sizeof(float) * (size_t)cw * sh * 3);
+        r->hbuf_floats = (size_t)cw * sh * 3;
+    }
+    if (!r->vrow || r->vrow_floats < (size_t)cw * 3) {
+        free(r->vrow);
+        r->vrow = xmalloc(sizeof(float) * (size_t)cw * 3);
+        r->vrow_floats = (size_t)cw * 3;
+    }
+
+    /* Horizontal pass: RGB565 source rows -> planar float rows (cw wide). */
+    size_t plane = (size_t)cw * sh;
+    for (unsigned y = 0; y < sh; y++) {
+        const uint16_t *row = (const uint16_t *)((const uint8_t *)src + (size_t)y * pitch);
+        float *pr = r->hbuf + (size_t)y * cw;
+        float *pg = pr + plane;
+        float *pb = pg + plane;
+        for (unsigned x = 0; x < cw; x++) {
+            const float *w = r->xt.weight + (size_t)x * (size_t)r->xt.max_taps;
+            int i0 = r->xt.first[x];
+            int n = r->xt.count[x];
+            float rr = 0.0f, gg = 0.0f, bb = 0.0f;
+            for (int k = 0; k < n; k++) {
+                uint16_t p = row[i0 + k];
+                float wk = w[k];
+                rr += wk * (float)((p >> 11) & 0x1f);
+                gg += wk * (float)((p >> 5) & 0x3f);
+                bb += wk * (float)(p & 0x1f);
+            }
+            pr[x] = rr * (255.0f / 31.0f);
+            pg[x] = gg * (255.0f / 63.0f);
+            pb[x] = bb * (255.0f / 31.0f);
         }
-        r->xmap_src_w = sw;
     }
-    for (unsigned y = 0; y < r->height; y++) {
-        uint64_t sy = (uint64_t)y * sh / r->height;
-        if (sy >= sh) sy = sh - 1;
-        const uint16_t *row = (const uint16_t *)((const uint8_t *)src + (size_t)sy * pitch);
-        uint8_t *dst = r->canvas + out_stride * y;
-        for (unsigned x = 0; x < r->width; x++) {
-            uint16_t p = row[r->xmap[x]];
-            unsigned rr = (p >> 11) & 0x1f;
-            unsigned gg = (p >> 5) & 0x3f;
-            unsigned bb = p & 0x1f;
-            dst[0] = (uint8_t)((rr << 3) | (rr >> 2));
-            dst[1] = (uint8_t)((gg << 2) | (gg >> 4));
-            dst[2] = (uint8_t)((bb << 3) | (bb >> 2));
+
+    /* Vertical pass: accumulate whole rows, then write into the canvas. */
+    size_t out_stride = (size_t)r->width * 3;
+    for (unsigned y = 0; y < ch; y++) {
+        const float *w = r->yt.weight + (size_t)y * (size_t)r->yt.max_taps;
+        int i0 = r->yt.first[y];
+        int n = r->yt.count[y];
+        memset(r->vrow, 0, sizeof(float) * (size_t)cw * 3);
+        for (int k = 0; k < n; k++) {
+            float wk = w[k];
+            const float *row = r->hbuf + (size_t)(i0 + k) * cw;
+            float *vr = r->vrow;
+            float *vg = vr + cw;
+            float *vb = vg + cw;
+            for (unsigned x = 0; x < cw; x++) {
+                vr[x] += wk * row[x];
+                vg[x] += wk * row[plane + x];
+                vb[x] += wk * row[2 * plane + x];
+            }
+        }
+        uint8_t *dst = r->canvas + (size_t)(r->content_y + y) * out_stride +
+                       (size_t)r->content_x * 3;
+        const float *vr = r->vrow;
+        const float *vg = vr + cw;
+        const float *vb = vg + cw;
+        for (unsigned x = 0; x < cw; x++) {
+            dst[0] = clamp8(vr[x]);
+            dst[1] = clamp8(vg[x]);
+            dst[2] = clamp8(vb[x]);
             dst += 3;
         }
     }
@@ -287,6 +464,25 @@ void recorder_push_frame(recorder *r, const uint16_t *pixels, unsigned w, unsign
                          double emu_fps) {
     if (!r || r->failed) return;
 
+    if (w && h) {
+        if (r->src_w == 0) {
+            r->src_w = w;
+            r->src_h = h;
+        } else if (w != r->src_w || h != r->src_h) {
+            r->res_changes++;
+            r->res_seq++;
+            r->res_from_w = r->src_w;
+            r->res_from_h = r->src_h;
+            r->res_to_w = w;
+            r->res_to_h = h;
+            r->src_w = w;
+            r->src_h = h;
+            xlog("recording: screen resolution changed %ux%u -> %ux%u; "
+                 "the %ux%u canvas stays the same",
+                 r->res_from_w, r->res_from_h, w, h, r->width, r->height);
+        }
+    }
+
     if (r->audio && push_audio(r, audio, audio_frames) != 0) return;
 
     /* The recording timeline is emulated time: audio is written at its native
@@ -298,7 +494,11 @@ void recorder_push_frame(recorder *r, const uint16_t *pixels, unsigned w, unsign
     double step = 1.0 / r->fps;
     int emitted = 0;
     while ((r->video_acc >= step || r->frames == 0) && emitted < 8) {
-        convert_frame(r, pixels, w, h, pitch);
+        if (pixels && w && h) {
+            scale_frame(r, pixels, w, h, pitch);
+        } else {
+            memset(r->canvas, 0, (size_t)r->width * r->height * 3);
+        }
         size_t bytes = (size_t)r->width * r->height * 3;
         size_t written = fwrite(r->canvas, 1, bytes, r->ff);
         if (written != bytes) {
@@ -331,6 +531,20 @@ unsigned recorder_width(const recorder *r) { return r ? r->width : 0; }
 unsigned recorder_height(const recorder *r) { return r ? r->height : 0; }
 bool recorder_has_audio(const recorder *r) { return r ? r->audio : false; }
 const char *recorder_path(const recorder *r) { return r ? r->out_path : ""; }
+unsigned recorder_source_width(const recorder *r) { return r ? r->src_w : 0; }
+unsigned recorder_source_height(const recorder *r) { return r ? r->src_h : 0; }
+uint64_t recorder_resolution_changes(const recorder *r) { return r ? r->res_changes : 0; }
+uint64_t recorder_resolution_seq(const recorder *r) { return r ? r->res_seq : 0; }
+
+bool recorder_last_resolution_change(const recorder *r, unsigned *from_w, unsigned *from_h,
+                                     unsigned *to_w, unsigned *to_h) {
+    if (!r || r->res_seq == 0) return false;
+    if (from_w) *from_w = r->res_from_w;
+    if (from_h) *from_h = r->res_from_h;
+    if (to_w) *to_w = r->res_to_w;
+    if (to_h) *to_h = r->res_to_h;
+    return true;
+}
 
 static void finish_wav(recorder *r) {
     if (!r->wav) return;
@@ -366,6 +580,17 @@ static int close_encoder(recorder *r, char *err, size_t errlen) {
     return 0;
 }
 
+static void free_buffers(recorder *r) {
+    free(r->canvas);
+    free(r->hbuf);
+    free(r->vrow);
+    tap_table_free(&r->xt);
+    tap_table_free(&r->yt);
+    r->canvas = NULL;
+    r->hbuf = NULL;
+    r->vrow = NULL;
+}
+
 int recorder_stop(recorder *r, char *err, size_t errlen) {
     if (!r) return -1;
     int rc = 0;
@@ -389,8 +614,7 @@ int recorder_stop(recorder *r, char *err, size_t errlen) {
         unlink(r->log_path);
         unlink(r->out_path);
         snprintf(err, errlen, "%s", why);
-        free(r->canvas);
-        free(r->xmap);
+        free_buffers(r);
         free(r);
         return -1;
     }
@@ -405,8 +629,7 @@ int recorder_stop(recorder *r, char *err, size_t errlen) {
         snprintf(err, errlen, "%s", why);
         /* keep the partial files, they can help diagnose the problem */
         xlog("recording failed: %s (partial video: %s)", why, r->video_tmp);
-        free(r->canvas);
-        free(r->xmap);
+        free_buffers(r);
         free(r);
         return -1;
     }
@@ -422,8 +645,7 @@ int recorder_stop(recorder *r, char *err, size_t errlen) {
         };
         if (run_ffmpeg(argv, r->log_path, err, errlen) != 0) {
             xlog("recording mux failed: %s", err);
-            free(r->canvas);
-            free(r->xmap);
+            free_buffers(r);
             free(r);
             return -1;
         }
@@ -432,8 +654,7 @@ int recorder_stop(recorder *r, char *err, size_t errlen) {
     } else {
         if (rename(r->video_tmp, out) != 0) {
             snprintf(err, errlen, "rename failed: %s", strerror(errno));
-            free(r->canvas);
-            free(r->xmap);
+            free_buffers(r);
             free(r);
             return -1;
         }
@@ -446,8 +667,7 @@ int recorder_stop(recorder *r, char *err, size_t errlen) {
          (unsigned long long)r->frames, recorder_seconds(r),
          stat(out, &st) == 0 ? (double)st.st_size / 1024.0 : 0.0);
 
-    free(r->canvas);
-    free(r->xmap);
+    free_buffers(r);
     free(r);
     return 0;
 }
@@ -471,7 +691,6 @@ void recorder_abort(recorder *r) {
     unlink(r->video_tmp);
     unlink(r->wav_tmp);
     unlink(r->log_path);
-    free(r->canvas);
-    free(r->xmap);
+    free_buffers(r);
     free(r);
 }

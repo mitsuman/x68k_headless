@@ -19,11 +19,24 @@
 #include "recorder.h"
 #include "vgm.h"
 
+/* px68k video/PAL state is exposed here for the 'dump' command. */
+#include "bg.h"
+#include "crtc.h"
+#include "palette.h"
+
 /* px68k internals we deliberately touch: only this flag, to make the core
  * publish its real refresh rate after the first boot frame. */
 extern int CHANGEAV_TIMING;
 /* raw X68000 key events (see libretro/keyboard.h); flag 1 = down, 2 = up */
 extern void send_keycode(uint8_t code, int flag);
+/* px68k's SCC mouse accumulator (see libretro/mouse.c) */
+extern void Mouse_GetPending(int *dx, int *dy);
+extern void Mouse_ClearPending(void);
+extern void Mouse_Reset(void);
+
+#define MOUSE_SETTLE_FRAMES 2
+#define MOUSE_STALL_FRAMES 120
+#define MOUSE_FLUSH_MAX_FRAMES 20000
 
 #define PX68K_KEY_DOWN 1
 #define PX68K_KEY_UP 2
@@ -59,6 +72,7 @@ struct emu {
     unsigned joy_mask[2];
     int mouse_dx, mouse_dy;
     unsigned mouse_buttons;
+    bool mouse_precise;
 
     held_key held[MAX_HELD_KEYS];
     int nheld;
@@ -287,19 +301,33 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
         if (id < 32) return (int16_t)((e->joy_mask[port] >> id) & 1u);
         return 0;
     case RETRO_DEVICE_MOUSE: {
-        /* The core reads X and Y once per frame.  Feed at most 100 units per
-         * frame so that large moves are not clamped away by the guest. */
+        /* The core reads X and Y once per frame.  Scripted moves are fed one
+         * unit at a time because the guest mouse driver accelerates large
+         * per-report deltas and the pointer then overshoots its target. */
+        const char *mv_env = getenv("X68K_MOUSE_MAXV");
+        int maxv = (mv_env && *mv_env) ? atoi(mv_env)
+                                        : (e->mouse_precise ? 1 : 100);
+        const char *sf = getenv("X68K_MOUSE_SPEEDFILE");
+        if (sf && *sf) {
+            FILE *fp = fopen(sf, "r");
+            if (fp) {
+                int v = 0;
+                if (fscanf(fp, "%d", &v) == 1 && v > 0) maxv = v;
+                fclose(fp);
+            }
+        }
+        if (maxv < 1) maxv = 1;
         if (id == RETRO_DEVICE_ID_MOUSE_X) {
             int v = e->mouse_dx;
-            if (v > 100) v = 100;
-            if (v < -100) v = -100;
+            if (v > maxv) v = maxv;
+            if (v < -maxv) v = -maxv;
             e->mouse_dx -= v;
             return (int16_t)v;
         }
         if (id == RETRO_DEVICE_ID_MOUSE_Y) {
             int v = e->mouse_dy;
-            if (v > 100) v = 100;
-            if (v < -100) v = -100;
+            if (v > maxv) v = maxv;
+            if (v < -maxv) v = -maxv;
             e->mouse_dy -= v;
             return (int16_t)v;
         }
@@ -681,6 +709,168 @@ int emu_snapshot(emu *e, const char *path, int scale, unsigned *out_w, unsigned 
 }
 
 /* ------------------------------------------------------------------ */
+/* PCG / palette / video introspection                                 */
+/* ------------------------------------------------------------------ */
+
+int emu_get_pcg(emu *e, unsigned tile, emu_pcg_view *out) {
+    if (!e || !e->booted || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->patterns = EMU_PCG_PATTERNS;
+    out->tile = tile;
+    if (tile == EMU_PCG16_TILE) {
+        out->indices = BG_GetPCG16();
+        out->bytes = EMU_PCG_PATTERNS * EMU_PCG16_TILE * EMU_PCG16_TILE;
+    } else if (tile == EMU_PCG8_TILE) {
+        out->indices = BG_GetPCG8();
+        out->bytes = EMU_PCG_PATTERNS * EMU_PCG8_TILE * EMU_PCG8_TILE;
+    } else {
+        return -1;
+    }
+    out->active = BG_GetCHRSize() == (int)tile;
+    return 0;
+}
+
+static void fill_palette_map(emu_palette_map *m, const uint8_t *regs, unsigned reg_offset,
+                             const uint16_t *actual) {
+    memset(m, 0, sizeof(*m));
+    for (unsigned i = 0; i < EMU_PALETTE_ENTRIES; i++) {
+        const uint8_t *r = regs + (reg_offset + i) * 2;
+        m->raw[i] = (uint16_t)(((uint16_t)r[0] << 8) | r[1]);
+        m->rgb565[i] = actual[i];
+        rgb565_to_rgb24(actual[i], m->rgb[i]);
+    }
+}
+
+void emu_palette_snapshot(emu *e, emu_palette_map *graphics, emu_palette_map *text) {
+    (void)e;
+    if (graphics) fill_palette_map(graphics, Pal_Regs, 0, GrphPal);
+    if (text) fill_palette_map(text, Pal_Regs, EMU_PALETTE_ENTRIES, TextPal);
+}
+
+void emu_video_snapshot(emu *e, emu_video_state *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!e || !e->booted) return;
+
+    out->chr_size = BG_GetCHRSize();
+    memcpy(out->bg_regs, BG_Regs, sizeof(out->bg_regs));
+    unsigned mask = out->chr_size == EMU_PCG16_TILE ? 0x3ffu : 0x1ffu;
+    out->bg0_scroll_x = (((unsigned)BG_Regs[0x00] << 8) | BG_Regs[0x01]) & mask;
+    out->bg0_scroll_y = (((unsigned)BG_Regs[0x02] << 8) | BG_Regs[0x03]) & mask;
+    out->bg1_scroll_x = (((unsigned)BG_Regs[0x04] << 8) | BG_Regs[0x05]) & mask;
+    out->bg1_scroll_y = (((unsigned)BG_Regs[0x06] << 8) | BG_Regs[0x07]) & mask;
+    out->bg0_on = (BG_Regs[0x09] & 0x01) != 0;
+    out->bg1_on = (BG_Regs[0x09] & 0x08) != 0;
+
+    memcpy(out->crtc_regs, CRTC_Regs, sizeof(out->crtc_regs));
+    memcpy(out->vc_regs[0], VCReg0, 2);
+    memcpy(out->vc_regs[1], VCReg1, 2);
+    memcpy(out->vc_regs[2], VCReg2, 2);
+    out->text_dot_x = TextDotX;
+    out->text_dot_y = TextDotY;
+    out->text_scroll_x = TextScrollX;
+    out->text_scroll_y = TextScrollY;
+    for (int i = 0; i < 4; i++) {
+        out->grph_scroll_x[i] = GrphScrollX[i];
+        out->grph_scroll_y[i] = GrphScrollY[i];
+    }
+
+    out->sprite_count = EMU_SPRITE_COUNT;
+    for (int i = 0; i < EMU_SPRITE_COUNT; i++) {
+        uint16_t x = 0, y = 0, ctrl = 0;
+        uint8_t pri = 0;
+        if (BG_GetSprite(i, &x, &y, &ctrl, &pri) != 0) continue;
+        emu_sprite_info *s = &out->sprites[i];
+        s->x = x;
+        s->y = y;
+        s->ctrl = ctrl;
+        s->pattern = ctrl & 0xff;
+        s->bank = (ctrl >> 8) & 0x0f;
+        s->priority = pri;
+    }
+}
+
+int emu_write_pcg_bin(emu *e, unsigned tile, const char *path, size_t *out_bytes,
+                      char *err, size_t errlen) {
+    emu_pcg_view view;
+    if (emu_get_pcg(e, tile, &view) != 0 || !view.indices)
+        return fail(err, errlen, "no PCG data is available");
+    FILE *f = fopen(path, "wb");
+    if (!f) return fail(err, errlen, "cannot create %s: %s", path, strerror(errno));
+    int rc = 0;
+    if (fwrite(view.indices, 1, view.bytes, f) != view.bytes) rc = -1;
+    if (fclose(f) != 0) rc = -1;
+    if (rc != 0) {
+        unlink(path);
+        return fail(err, errlen, "failed to write %s", path);
+    }
+    if (out_bytes) *out_bytes = view.bytes;
+    return 0;
+}
+
+int emu_write_pcg_png(emu *e, unsigned tile, int bank, int scale, bool grid,
+                      const char *path, unsigned *out_w, unsigned *out_h,
+                      size_t *out_bytes, char *err, size_t errlen) {
+    emu_pcg_view view;
+    if (emu_get_pcg(e, tile, &view) != 0 || !view.indices)
+        return fail(err, errlen, "no PCG data is available");
+    if (bank < 0) bank = 0;
+    if (bank > 15) bank = 15;
+    if (scale < 1) scale = 1;
+    if (scale > 8) scale = 8;
+
+    const unsigned cols = 16;
+    const unsigned rows = (view.patterns + cols - 1) / cols;
+    const unsigned pitch = tile + (grid ? 1u : 0u);
+    const unsigned sheet_w = cols * tile + (grid ? cols - 1 : 0);
+    const unsigned sheet_h = rows * tile + (grid ? rows - 1 : 0);
+    unsigned w = sheet_w * (unsigned)scale;
+    unsigned h = sheet_h * (unsigned)scale;
+    if (w == 0 || h == 0 || w > 8192 || h > 8192)
+        return fail(err, errlen, "PCG preview would be too large");
+
+    uint8_t *rgb = xmalloc((size_t)w * h * 3);
+    const uint16_t *pal = TextPal + (bank << 4);
+    for (unsigned y = 0; y < sheet_h; y++) {
+        unsigned py = y % pitch;
+        unsigned pat_row = y / pitch;
+        for (unsigned x = 0; x < sheet_w; x++) {
+            unsigned px = x % pitch;
+            unsigned pat_col = x / pitch;
+            uint8_t out[3] = {0, 0, 0};
+            if (!grid || (px < tile && py < tile)) {
+                unsigned pi = pat_row * cols + pat_col;
+                uint8_t idx = 0;
+                if (pi < view.patterns && px < tile && py < tile)
+                    idx = view.indices[pi * tile * tile + py * tile + px] & 0x0f;
+                rgb565_to_rgb24(pal[idx], out);
+            } else {
+                out[0] = out[1] = out[2] = 0x28; /* tile separator */
+            }
+            for (int yy = 0; yy < scale; yy++) {
+                uint8_t *dst = rgb + (size_t)(y * (unsigned)scale + (unsigned)yy) * w * 3 +
+                               (size_t)x * (unsigned)scale * 3;
+                for (int xx = 0; xx < scale; xx++) {
+                    dst[0] = out[0];
+                    dst[1] = out[1];
+                    dst[2] = out[2];
+                    dst += 3;
+                }
+            }
+        }
+    }
+
+    int rc = png_write_rgb(path, rgb, w, h);
+    free(rgb);
+    if (rc != 0) return fail(err, errlen, "failed to write PNG: %s", path);
+    struct stat st;
+    if (stat(path, &st) == 0 && out_bytes) *out_bytes = (size_t)st.st_size;
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* input                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -772,6 +962,9 @@ int emu_joy_event(emu *e, int port, const char *button, bool down, char *err, si
 
 int emu_mouse_move(emu *e, int dx, int dy, char *err, size_t errlen) {
     if (!e) return fail(err, errlen, "machine is not running");
+    /* Scripted movement is always paced one unit per frame so the guest's
+     * pointer acceleration cannot turn a 100 px move into a 250 px one. */
+    e->mouse_precise = true;
     long long nx = (long long)e->mouse_dx + dx;
     long long ny = (long long)e->mouse_dy + dy;
     if (nx > 100000) nx = 100000;
@@ -792,6 +985,100 @@ int emu_mouse_button(emu *e, const char *button, bool down, char *err, size_t er
     if (down) e->mouse_buttons |= bit;
     else e->mouse_buttons &= ~bit;
     return 0;
+}
+
+void emu_mouse_pending(const emu *e, int *dx, int *dy) {
+    int cdx = 0, cdy = 0;
+    if (e) Mouse_GetPending(&cdx, &cdy);
+    if (dx) *dx = e ? e->mouse_dx + cdx : 0;
+    if (dy) *dy = e ? e->mouse_dy + cdy : 0;
+}
+
+int emu_mouse_flush(emu *e, emu_step_result *res, bool *delivered, volatile int *stop_flag) {
+    if (res) memset(res, 0, sizeof(*res));
+    if (delivered) *delivered = true;
+    if (!e || !e->booted) return -1;
+
+    int pdx = 0, pdy = 0;
+    emu_mouse_pending(e, &pdx, &pdy);
+    if (pdx == 0 && pdy == 0) return 0;
+
+    int64_t t0 = now_ms_monotonic();
+    uint64_t f0 = e->frame;
+    double s0 = e->seconds;
+
+    bool old_precise = e->mouse_precise;
+    e->mouse_precise = true;
+
+    long long total = (long long)abs(pdx) + abs(pdy);
+    long long max_frames = total + 600;
+    if (max_frames > MOUSE_FLUSH_MAX_FRAMES) max_frames = MOUSE_FLUSH_MAX_FRAMES;
+
+    bool ok = false;
+    int rc = 0;
+    long long stepped = 0;
+    int last_pending = abs(pdx) + abs(pdy);
+    int stalled = 0;
+
+    while (stepped < max_frames) {
+        emu_mouse_pending(e, &pdx, &pdy);
+        int pending = abs(pdx) + abs(pdy);
+        if (pending == 0) {
+            ok = true;
+            break;
+        }
+        /* The guest reads the SCC in its own time.  Once our queue is empty,
+         * give it a couple of seconds of emulated time; if the pending amount
+         * never drops, no mouse driver is polling and waiting longer is
+         * pointless. */
+        if (e->mouse_dx == 0 && e->mouse_dy == 0) {
+            if (pending < last_pending) {
+                last_pending = pending;
+                stalled = 0;
+            } else if (++stalled >= MOUSE_STALL_FRAMES) {
+                break;
+            }
+        } else {
+            last_pending = pending;
+            stalled = 0;
+        }
+
+        emu_step_result one;
+        if (emu_step_frames(e, 1, &one, stop_flag) != 0) {
+            rc = -1;
+            goto out;
+        }
+        stepped += one.frames;
+        if (one.frames == 0) break; /* interrupted by the stop flag */
+    }
+
+    if (ok) {
+        /* Let the guest consume the final SCC report and repaint. */
+        for (int i = 0; i < MOUSE_SETTLE_FRAMES; i++) {
+            emu_step_result one;
+            if (emu_step_frames(e, 1, &one, stop_flag) != 0) {
+                rc = -1;
+                goto out;
+            }
+            stepped += one.frames;
+            if (one.frames == 0) break;
+        }
+    } else {
+        /* Do not let stale movement fire later in an unrelated context. */
+        Mouse_ClearPending();
+        e->mouse_dx = e->mouse_dy = 0;
+    }
+
+    if (res) {
+        res->frames = e->frame - f0;
+        res->emu_seconds = e->seconds - s0;
+        res->wall_ms = now_ms_monotonic() - t0;
+    }
+    if (delivered) *delivered = ok;
+
+out:
+    e->mouse_precise = old_precise;
+    return rc;
 }
 
 int emu_held_keys(const emu *e, const char **names, int max) {
@@ -1034,6 +1321,7 @@ int emu_load_state(emu *e, const char *path, char *err, size_t errlen) {
     e->hash_valid = false;
     e->video_updated = false;
     e->mouse_dx = e->mouse_dy = 0;
+    Mouse_Reset();
     return 0;
 }
 
@@ -1050,6 +1338,7 @@ void emu_reset(emu *e) {
     e->hash_valid = false;
     e->mouse_dx = e->mouse_dy = 0;
     e->mouse_buttons = 0;
+    Mouse_Reset();
     memset(e->retro_keys, 0, sizeof(e->retro_keys));
     e->joy_mask[0] = e->joy_mask[1] = 0;
     e->nheld = 0;

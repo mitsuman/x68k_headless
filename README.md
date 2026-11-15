@@ -55,10 +55,13 @@ LLM 向けの運用ガイドは [docs/LLM_GUIDE.md](docs/LLM_GUIDE.md) を参照
   `500ms`, `2m`, `90f`).
 * Dump the current screen as a PNG at native resolution (optional integer
   upscaling).
+* Dump PCG pattern data (256 16x16 and 256 8x8 sprite/BG tiles), both palettes
+  and the video-controller state as PNG/BIN/JSON for asset inspection.
 * Start/stop recording of video + stereo audio to MP4 (H.264 + AAC).
 * VGM sound logs of the YM2151 (OPM) and MSM6258 ADPCM, for chiptune players.
-* Keyboard (including chords and text typing), relative mouse, and X68000
-  joystick input; `tap`, `hold`, `down`/`up` variants.
+* Keyboard (including chords and text typing), precise relative mouse with
+  single/double-click helpers, and X68000 joystick input; `tap`, `hold`,
+  `down`/`up` variants.
 * Hot floppy swap with write-back to the image file.
 * Compressed save states (branching / retry), machine reset, SRAM persistence,
   configurable RAM / CPU speed / refresh-rate mode / joystick type.
@@ -108,7 +111,7 @@ or simply `make` (a thin CMake wrapper). Install with `cmake --install build`
 ./build/x68k key tap return
 ./build/x68k joy hold 1s right --snap
 ./build/x68k mouse move 30 -10
-./build/x68k step 0.2s --snap
+./build/x68k mouse click left
 
 # Record a few seconds of emulated time.
 ./build/x68k record start
@@ -139,7 +142,7 @@ current directory.
   blocks other commands; that is intentional and keeps state deterministic.
 * Emulation only advances inside `step` and inside input conveniences that
   hold something for a duration (`key tap`, `key hold`, `key type`, `joy tap`,
-  `joy hold`, `mouse click`).
+  `joy hold`, `mouse click`, `mouse doubleclick`) or deliver a mouse move.
 * `x68k quit` finalizes any recording, flushes floppy write-back and SRAM, and
   stops the daemon.
 
@@ -206,6 +209,37 @@ Writes the current screen to a PNG. Native X68000 resolution is used unless
 `--scale` is given (nearest-neighbour). The parent directory is created.
 `--out -` is not supported (the JSON response always contains a path).
 
+### `dump`
+
+```sh
+x68k dump [--out DIR] [--scale 1..8] [--bank 0..15] [--grid]
+```
+
+Dumps the expanded sprite/BG character patterns (the "PCG": 256 16×16,
+16-colour patterns, plus the 8×8 BG set), both palettes and the video-controller
+state. The default directory is `<home>/dumps/f<frame>/`; a numeric suffix is
+added if that directory already exists. `--out DIR` picks another directory.
+
+* `pcg16.png` / `pcg16.bin`: 256 16×16 patterns in a 16-column contact sheet.
+  The `.bin` is pattern-major, one byte per pixel (0–15), 65,536 bytes.
+* `pcg8.png` / `pcg8.bin`: the 256 8×8 BG patterns, same layout (16,384 bytes).
+* `palette.json` / `palette.bin`: the graphics palette and the text/sprite/BG
+  palette. The JSON has 256 entries each with the raw 16-bit `0xGRBI` word,
+  RGB565 and `#rrggbb`; the `.bin` is the 1024 raw palette bytes (graphics
+  words then text words, big-endian).
+* `video.json`: BG registers/scroll values, all 128 sprite attributes, CRTC/text
+  registers and graphic scroll values.
+
+The PNG previews use the **text/sprite/BG palette**; `--bank` selects one of
+its 16 palette banks for the preview. `--grid` adds a one-pixel separator
+between tiles, and `--scale` enlarges the sheet. Neither option changes the
+`.bin` data. The JSON response contains a `pcg` object (paths and layout),
+the palette data inline, and a `video` summary with the path to `video.json`.
+
+The PCG `.bin` files are the expanded patterns the core draws with; they are not
+the packed source bytes in BG memory. Sprite palette bank and priority are per
+sprite, so use `--bank` (or `video.json`) when matching a preview to a screen.
+
 ### `record`
 
 ```sh
@@ -214,8 +248,21 @@ x68k record stop
 x68k record status
 ```
 
-* Defaults: 640×480, the current refresh rate as the output frame rate,
-  stereo audio. Codec: H.264 (`libx264`, ultrafast, CRF 18) + AAC 160 kbps.
+* Defaults: a fixed **1600×1024** canvas, the current refresh rate as the output
+  frame rate, and stereo audio. Codec: H.264 (`libx264`, ultrafast, CRF 18) +
+  AAC 160 kbps. `--size WxH` overrides the canvas (and must be even).
+* The emulated display is 4:3 in every video mode, so each frame is resampled
+  into a centred 4:3 rectangle (1364×1024 in the default canvas) with black
+  bars. Dots are not square, so the horizontal and vertical scales differ.
+  Upscaling uses Lanczos-3, downscaling an area/box filter.
+* The canvas and the content rectangle never change during a recording, so a
+  video-mode switch keeps the same geometry and framing. The command that
+  steps over the switch returns an informational `warning` with
+  `code: "recording_resolution_changed"` (`from`, `to`, `output`);
+  `state.recording` reports the current `source_width`/`source_height` and a
+  `resolution_changes` count.
+* Recording can start before the first frame; the first emulated frame picks
+  the resampling tables.
 * The recording timeline is **emulated time**. Audio is written at its native
   44.1 kHz; video frames are duplicated or dropped if `--fps` differs from the
   emulated refresh rate. `--fps 30` therefore produces a real-time 30 fps file,
@@ -225,7 +272,7 @@ x68k record status
 * `record stop` finalizes and muxes the MP4. If no frames were recorded, it
   returns an error and removes the empty files.
 * Recording requires `ffmpeg`; `record start` fails with a clear message if it
-  is missing. `--size` must be even (yuv420p).
+  is missing.
 * A recording that is still active when you `quit` or `boot` is finalized first.
 
 #### VGM sound logs
@@ -274,13 +321,15 @@ x68k joy tap|press <button...> [--hold 100ms] [--port 1|2]
 x68k joy down|up <button...> [--port 1|2]
 x68k joy hold <DURATION> <button...> [--port 1|2]
 
-x68k mouse move DX DY
+x68k mouse move DX DY [--no-wait]
 x68k mouse down|up [left|right]
-x68k mouse click [left|right] [--hold 100ms]
+x68k mouse click|singleclick [left|right] [--hold 100ms]
+x68k mouse doubleclick|double-click|dblclick [left|right] [--hold 100ms] [--interval 100ms]
 ```
 
-* `tap`/`press`/`hold`/`click` **advance time** (hold + one frame to deliver the
-  release). `down`/`up`/`move` do not; follow them with `step`.
+* `tap`/`press`/`hold`/`click`/`doubleclick` **advance time** (hold + one frame
+  to deliver the release). `down`/`up` do not; follow them with `step`.
+  `mouse move` also advances time unless `--no-wait` is given.
 * Chords are joined with `+`: `ctrl+shift+s`, `shift+up`. Use `plus` for the
   `+` key. Uppercase letters and shifted symbols automatically hold shift.
 * `key type` accepts printable ASCII plus `\n`, `\t`, `\r`, `\b`, `\\` and
@@ -289,9 +338,16 @@ x68k mouse click [left|right] [--hold 100ms]
 * Joystick buttons: `up down left right a b x y l r start select`
   (aliases `trg1`/`trg2`, `run`, `mode`, `b1`/`b2`). `a` is TRG1 and `b` is
   TRG2 because the frontend configures the core with `VbtnSwap`.
-* Mouse movement is **relative** and is delivered on the following frames; a
-  large move is split across frames so the guest does not lose motion. Use
-  several `mouse move` + `step` pairs to travel across the screen.
+* Mouse movement is **relative** and is delivered one pixel per frame, so the
+  guest's pointer acceleration cannot make a 100 px move overshoot. `mouse
+  move` waits until the guest has consumed the whole move and returns
+  `frames`, `emu_seconds` and `delivered`. `--no-wait` only queues it; the next
+  `step` or click delivers it. A 100 px move costs about 100 frames of
+  emulated time, but only a fraction of a second of wall time.
+* `mouse click` is a single click (`singleclick` is an alias).
+  `mouse doubleclick` (`double-click`/`dblclick`) performs two clicks with
+  `--hold` for each press and `--interval` between them. Both first deliver any
+  queued movement, then click at the current pointer position.
 * `key`, `joy` and `mouse` responses and the `state` object report what is
   currently held.
 
@@ -348,11 +404,12 @@ error.
   (or the `compat` rates 55.5/59.94). The mode can change while a game boots.
 * Screenshots use the core's native framebuffer, typically 512×512 or
   768×512. The aspect ratio is 4:3; pixels are not square.
-* Recordings use a fixed 4:3 canvas (640×480 by default) with nearest-neighbour
-  scaling from the native framebuffer, so mode switches and letterboxing stay
-  consistent.
-* There is no real-time pacing. `step 10s` may finish in 0.1 s; recording adds
-  encoder cost but is still much faster than real time.
+* Recordings use a fixed 1600×1024 canvas: the current 4:3 image is resampled
+  into a centred 1364×1024 rectangle (black bars on the sides). Because the
+  canvas never changes, a video-mode switch mid-recording keeps the same
+  geometry; the switch is still reported as an informational warning.
+* There is no real-time pacing. `step 10s` may finish in 0.1 s; recording at
+  1600×1024 costs roughly half of real time on a modern laptop.
 
 ## JSON output
 
@@ -388,10 +445,20 @@ Every command prints exactly one JSON object. Success:
 ```
 
 * `state.recording` is `null`, an MP4 object (`"format":"mp4"`), or a VGM
-  object (`"format":"vgm"`, with `samples`, `adpcm`, `chips`).
+  object (`"format":"vgm"`, with `samples`, `adpcm`, `chips`). An MP4 object
+  also has `source_width`/`source_height` (the native screen size of the last
+  frame) and `resolution_changes`.
+* A command that steps over a video-mode switch during recording adds
+  `data.warning`:
+  `{"code":"recording_resolution_changed","message":...,"from":"768x512","to":"512x512","output":"1600x1024","hint":...}`.
+  The recording continues with the same canvas and geometry.
 * `state.screen.hash` is a 64-bit FNV-1a of the native framebuffer.
   `state.screen.changed` compares it with the screen at the previous command.
   This lets an agent wait for loading screens without fetching images.
+* `dump` returns `data.dir`, `data.frame`, `data.pcg` (the `16x16` and `8x8`
+  sheets with `.png`/`.bin` paths, sizes and layout), `data.palette` (the same
+  object written to `palette.json`) and a `data.video` summary pointing at
+  `video.json`.
 * Errors use:
 
 ```json
@@ -402,7 +469,8 @@ Every command prints exactly one JSON object. Success:
 Exit codes: `0` success, `1` command error, `2` usage error, `3` daemon
 unreachable/startup failure. Error codes are stable strings
 (`not_booted`, `media_missing`, `roms_error`, `bad_media`, `usage`,
-`no_frame`, `recording_failed`, `state_missing`, `state_error`, ...).
+`no_frame`, `dump_failed`, `recording_failed`, `state_missing`, `state_error`,
+...).
 
 ## Sessions and files
 
@@ -415,6 +483,7 @@ Default home: `$X68K_HOME` or `~/.x68k` (mode 0700).
   screens/f00000667.png ...
   recordings/rec-YYYYMMDD-HHMMSS.mp4 ...
   states/NAME.bin ...
+  dumps/f00000667/{pcg16,pcg8}.{png,bin},palette.{json,bin},video.json ...
 ```
 
 Use `--home` to run several independent machines/games at once. The daemon is
@@ -441,10 +510,15 @@ and ffmpeg errors.
   IPL scans drives a few frames later, so this reproduces normal booting; a
   program that probes the FDC in the first frame of reset could miss it.
 * Mouse coordinates are relative; there is no host-side cursor or absolute
-  position.
+  position. Scripted moves are paced at one unit per frame for accuracy, so a
+  large move consumes a corresponding amount of emulated time.
 * `key type` uses US-ASCII key positions translated through px68k's keyboard
   table. Some shifted symbols may land on different JIS key positions than a
   real Japanese keyboard.
+* `dump` exposes the core's expanded PCG arrays. Games that draw everything in
+  GVRAM/CPU (rather than the sprite/BG controller) leave them empty, so an
+  all-zero `pcg16.bin` can be normal. PCG previews use a single text-palette
+  bank; sprite/BG tiles may use other banks at run time.
 * The core is GPLv2 and is statically linked; the resulting binary is GPLv2.
 * Disk images are treated as data. A malicious image exploits the emulator's
   C code, so only run images you trust.

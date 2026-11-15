@@ -300,6 +300,38 @@ struct SPRITECTRLTBL {
 #pragma pack(pop)
 typedef struct SPRITECTRLTBL SPRITECTRLTBL_T;
 
+/* Expanded sprite/BG character patterns.  BGCHR16/BGCHR8 are one byte per
+ * pixel (0..15) in pattern-major order, so the frontend can serialise or
+ * preview them without knowing the source memory layout. */
+const uint8_t *BG_GetPCG16(void)
+{
+	return BGCHR16;
+}
+
+const uint8_t *BG_GetPCG8(void)
+{
+	return BGCHR8;
+}
+
+int BG_GetCHRSize(void)
+{
+	return BG_CHRSIZE;
+}
+
+int BG_GetSprite(int index, uint16_t *x, uint16_t *y, uint16_t *ctrl,
+                 uint8_t *priority)
+{
+	SPRITECTRLTBL_T *sct = (SPRITECTRLTBL_T *)Sprite_Regs;
+
+	if (index < 0 || index >= BG_SPRITE_COUNT)
+		return -1;
+	if (x) *x = sct[index].sprite_posx;
+	if (y) *y = sct[index].sprite_posy;
+	if (ctrl) *ctrl = sct[index].sprite_ctrl;
+	if (priority) *priority = sct[index].sprite_ply & 3;
+	return 0;
+}
+
 static INLINE void Sprite_DrawLineMcr(int pri)
 {
 	SPRITECTRLTBL_T *sct = (SPRITECTRLTBL_T *)Sprite_Regs;

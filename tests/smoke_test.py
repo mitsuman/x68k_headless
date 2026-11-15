@@ -98,6 +98,8 @@ def main():
         check(rc == 0 and j and j.get("ok"), "doctor", err)
         rc, j, _, _, _ = run(binary, home, "step", "1s")
         check(rc == 1 and j and j["error"]["code"] == "not_booted", "step before boot -> not_booted")
+        rc, j, _, _, _ = run(binary, home, "dump")
+        check(rc == 1 and j and j["error"]["code"] == "not_booted", "dump before boot -> not_booted")
         rc, j, _, _, _ = run(binary, home, "step", "nonsense")
         check(rc == 2 and j and j["error"]["code"] == "usage", "bad duration -> usage (exit 2)")
 
@@ -134,6 +136,47 @@ def main():
         if j and j.get("ok"):
             check(j["data"]["width"] == w0 * 2 and j["data"]["height"] == h0 * 2, "snap scale doubles dimensions")
 
+        print("== dump (PCG / palette / video state)")
+        dump_dir = os.path.join(tmp, "dump", "custom")
+        rc, j, _, _, err = run(binary, home, "dump", "--out", dump_dir,
+                               "--scale", "2", "--bank", "3", "--grid")
+        check(rc == 0 and j and j.get("ok"), "dump", err)
+        if j and j.get("ok"):
+            data = j["data"]
+            check(data.get("dir") == dump_dir, "dump --out directory")
+            check(data["pcg"]["active"] in ("16x16", "8x8"), "dump reports active PCG size")
+            check(data["palette"]["text"]["entries"] == 256, "palette has 256 text entries")
+            check(len(data["palette"]["graphics"]["rgb"]) == 256, "palette has 256 graphics colours")
+            for key, nbin, nsheet in (("16x16", 65536, 271), ("8x8", 16384, 143)):
+                f = data["pcg"][key]
+                check(os.path.isfile(f["png"]), f"dump {key} PNG exists")
+                check(os.path.isfile(f["bin"]), f"dump {key} BIN exists")
+                if os.path.isfile(f["png"]):
+                    with open(f["png"], "rb") as fh:
+                        check(fh.read(8) == b"\x89PNG\r\n\x1a\n", f"dump {key} PNG signature")
+                if os.path.isfile(f["bin"]):
+                    check(os.path.getsize(f["bin"]) == nbin, f"dump {key} BIN size")
+                check(f["png_width"] == nsheet * 2 and f["png_height"] == nsheet * 2,
+                      f"dump {key} scaled sheet dimensions")
+                check(f["tile"] == int(key.split("x")[0]), f"dump {key} tile size")
+            check(os.path.isfile(data["palette"]["file"]), "palette.json exists")
+            check(os.path.isfile(data["palette"]["bin"])
+                  and os.path.getsize(data["palette"]["bin"]) == 1024,
+                  "palette.bin is 1024 bytes")
+            with open(data["palette"]["file"]) as fh:
+                pj = json.load(fh)
+            check(len(pj["text"]["raw"]) == 256 and len(pj["text"]["rgb"]) == 256,
+                  "palette.json parses")
+            check(os.path.isfile(data["video"]["file"]), "video.json exists")
+            with open(data["video"]["file"]) as fh:
+                vj = json.load(fh)
+            check(len(vj["sprites"]) == 128 and "crtc" in vj and "bg" in vj,
+                  "video.json has sprites/BG/CRTC")
+            rc, j2, _, _, _ = run(binary, home, "dump")
+            check(rc == 0 and j2 and j2.get("ok")
+                  and j2["data"]["dir"].startswith(os.path.join(home, "dumps")),
+                  "dump default directory under <home>/dumps")
+
         print("== save states")
         rc, j, _, _, _ = run(binary, home, "save", "smoke1")
         check(rc == 0 and j and j.get("ok") and j["data"]["save"]["bytes"] > 0, "save state")
@@ -169,10 +212,29 @@ def main():
         check(rc == 0 and j and j.get("ok") and j["data"]["frames"] > 0, "joy hold left+a")
 
         rc, j, _, _, _ = run(binary, home, "mouse", "move", "20", "-10")
-        check(rc == 0 and j and j.get("ok"), "mouse move")
+        check(rc == 0 and j and j.get("ok") and j["data"]["frames"] > 0,
+              "mouse move delivers")
+        check(j and j.get("data", {}).get("delivered") in (True, False), "mouse move reports delivered")
+        rc, j, _, _, _ = run(binary, home, "mouse", "move", "--no-wait", "5", "5")
+        check(rc == 0 and j and j.get("ok") and j["data"]["delivered"] is False,
+              "mouse move --no-wait queues")
         rc, j, _, _, _ = run(binary, home, "step", "0.1s")
         rc, j, _, _, _ = run(binary, home, "mouse", "click", "left", "--hold", "50ms")
-        check(rc == 0 and j and j.get("ok"), "mouse click left")
+        check(rc == 0 and j and j.get("ok") and j["data"]["clicks"] == 1,
+              "mouse click left")
+        rc, j, _, _, _ = run(binary, home, "mouse", "singleclick", "left", "--hold", "50ms")
+        check(rc == 0 and j and j.get("ok") and j["data"]["clicks"] == 1,
+              "mouse singleclick alias")
+        rc, j, _, _, _ = run(binary, home, "mouse", "doubleclick", "left",
+                             "--hold", "50ms", "--interval", "80ms")
+        check(rc == 0 and j and j.get("ok") and j["data"]["clicks"] == 2,
+              "mouse doubleclick left")
+        check(j and j.get("data", {}).get("interval_frames", 0) > 0,
+              "mouse doubleclick interval")
+        rc, j, _, _, _ = run(binary, home, "mouse", "move", "--no-wait", "5", "5")
+        rc, j, _, _, _ = run(binary, home, "mouse", "click", "left", "--hold", "50ms")
+        check(rc == 0 and j and j.get("data", {}).get("move_frames", 0) > 0,
+              "mouse click flushes queued movement")
 
         print("== disks")
         if d2:
@@ -188,14 +250,21 @@ def main():
             rec = os.path.join(tmp, "rec.mp4")
             rc, j, _, _, err = run(binary, home, "record", "start", "--out", rec)
             check(rc == 0 and j and j.get("ok"), "record start", err)
+            if j and j.get("ok"):
+                check(j["data"]["recording"]["width"] == 1600 and
+                      j["data"]["recording"]["height"] == 1024,
+                      "record start uses the 1600x1024 canvas")
             rc, j, _, _, _ = run(binary, home, "step", "0.6s")
             rc, j, _, _, err = run(binary, home, "record", "stop")
             check(rc == 0 and j and j.get("ok"), "record stop", err)
+            if j and j.get("ok"):
+                check("resolution_changes" in j["data"]["recording"],
+                      "record stop reports resolution_changes")
             check(os.path.isfile(rec), "recording file exists")
             if os.path.isfile(rec) and has_ffprobe:
                 pr = subprocess.run(
                     ["ffprobe", "-v", "error", "-show_entries",
-                     "stream=codec_type", "-show_entries", "format=duration",
+                     "stream=codec_type,width,height", "-show_entries", "format=duration",
                      "-of", "json", rec],
                     capture_output=True, text=True)
                 try:
@@ -207,12 +276,24 @@ def main():
                 check("video" in types, "recording has a video stream")
                 check("audio" in types, "recording has an audio stream")
                 check(0.3 <= duration <= 1.0, f"recording duration ~0.6s (got {duration:.3f}s)")
+                vs = [s for s in pj.get("streams", []) if s.get("codec_type") == "video"]
+                if vs:
+                    check(vs[0].get("width") == 1600 and vs[0].get("height") == 1024,
+                          "recorded video keeps the canvas size")
 
             rec2 = os.path.join(tmp, "rec_noaudio.mp4")
-            run(binary, home, "record", "start", "--out", rec2, "--no-audio", "--fps", "30")
+            run(binary, home, "record", "start", "--out", rec2, "--no-audio",
+                "--fps", "30", "--size", "320x240")
             run(binary, home, "step", "0.4s")
             rc, j, _, _, _ = run(binary, home, "record", "stop")
             check(rc == 0 and os.path.isfile(rec2), "video-only recording")
+            if os.path.isfile(rec2) and has_ffprobe:
+                pr = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height", "-of", "csv=p=0", rec2],
+                    capture_output=True, text=True)
+                check(pr.stdout.strip() == "320,240",
+                      f"--size overrides the recording size (got {pr.stdout.strip()})")
         else:
             info("ffmpeg not found: skipping recording tests")
 

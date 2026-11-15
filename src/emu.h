@@ -37,6 +37,60 @@ typedef struct {
     int64_t wall_ms;
 } emu_step_result;
 
+/* ---- PCG / palette / video introspection -------------------------- */
+
+#define EMU_PCG_PATTERNS  256
+#define EMU_PCG16_TILE     16
+#define EMU_PCG8_TILE       8
+#define EMU_PALETTE_ENTRIES 256
+#define EMU_SPRITE_COUNT   128
+
+typedef struct {
+    const uint8_t *indices; /* patterns * tile * tile, one palette index per byte */
+    unsigned patterns;
+    unsigned tile;
+    unsigned bytes;
+    bool active;            /* BG character size matches this tile */
+} emu_pcg_view;
+
+typedef struct {
+    uint16_t raw[EMU_PALETTE_ENTRIES];   /* 0xGRBI hardware value */
+    uint16_t rgb565[EMU_PALETTE_ENTRIES];/* actual host colour */
+    uint8_t rgb[EMU_PALETTE_ENTRIES][3];
+} emu_palette_map;
+
+typedef struct {
+    unsigned x, y;
+    uint16_t ctrl;
+    unsigned pattern;
+    unsigned bank;
+    unsigned priority;
+} emu_sprite_info;
+
+typedef struct {
+    int chr_size;
+    uint8_t bg_regs[0x12];
+    bool bg0_on, bg1_on;
+    unsigned bg0_scroll_x, bg0_scroll_y;
+    unsigned bg1_scroll_x, bg1_scroll_y;
+    uint8_t crtc_regs[48];
+    uint8_t vc_regs[3][2];
+    unsigned text_dot_x, text_dot_y;
+    unsigned text_scroll_x, text_scroll_y;
+    unsigned grph_scroll_x[4], grph_scroll_y[4];
+    int sprite_count;
+    emu_sprite_info sprites[EMU_SPRITE_COUNT];
+} emu_video_state;
+
+int  emu_get_pcg(emu *e, unsigned tile, emu_pcg_view *out);
+void emu_palette_snapshot(emu *e, emu_palette_map *graphics, emu_palette_map *text);
+void emu_video_snapshot(emu *e, emu_video_state *out);
+int  emu_write_pcg_png(emu *e, unsigned tile, int bank, int scale, bool grid,
+                       const char *path, unsigned *out_w, unsigned *out_h,
+                       size_t *out_bytes, char *err, size_t errlen);
+int  emu_write_pcg_bin(emu *e, unsigned tile, const char *path, size_t *out_bytes,
+                       char *err, size_t errlen);
+
 emu *emu_create(const emu_config *cfg, char *err, size_t errlen);
 void emu_destroy(emu *e);
 bool emu_is_booted(const emu *e);
@@ -58,6 +112,11 @@ int emu_keys_event(emu *e, const key_action *acts, int n, bool down, char *err, 
 int emu_joy_event(emu *e, int port, const char *button, bool down, char *err, size_t errlen);
 int emu_mouse_move(emu *e, int dx, int dy, char *err, size_t errlen);
 int emu_mouse_button(emu *e, const char *button, bool down, char *err, size_t errlen);
+/* Advances frames until the queued relative movement has been consumed by
+ * the guest.  delivered is false if the guest stopped polling (the remaining
+ * movement is discarded) or the step was interrupted. */
+int emu_mouse_flush(emu *e, emu_step_result *res, bool *delivered, volatile int *stop_flag);
+void emu_mouse_pending(const emu *e, int *dx, int *dy);
 
 /* floppy media */
 int emu_insert_fdd(emu *e, int drive, const char *path, char *err, size_t errlen);

@@ -25,6 +25,11 @@
 #include "util.h"
 #include "vgm.h"
 
+/* Recording canvas.  1600x1024 comfortably fits the 4:3 emulated display at up
+ * to 2x the 768x512 31 kHz framebuffer; the image is letterboxed inside it. */
+#define RECORD_DEFAULT_W 1600u
+#define RECORD_DEFAULT_H 1024u
+
 typedef struct {
     app_paths paths;
     int listen_fd;
@@ -43,6 +48,7 @@ typedef struct {
     uint64_t rec_start_frame;
     double rec_start_seconds;
     int64_t rec_start_wall_ms;
+    uint64_t rec_res_seq;   /* last reported mid-recording resolution change */
 
     uint64_t last_hash;
     bool last_hash_valid;
@@ -156,6 +162,13 @@ static json *recording_obj(server *s) {
     json_set_int(r, "frames", (int64_t)recorder_frames(s->rec));
     json_set_double(r, "seconds", recorder_seconds(s->rec));
     json_set_int(r, "started_frame", (int64_t)s->rec_start_frame);
+    unsigned sw = recorder_source_width(s->rec);
+    unsigned sh = recorder_source_height(s->rec);
+    if (sw && sh) {
+        json_set_int(r, "source_width", sw);
+        json_set_int(r, "source_height", sh);
+    }
+    json_set_int(r, "resolution_changes", (int64_t)recorder_resolution_changes(s->rec));
     char fmsg[1024];
     if (recorder_failed(s->rec, fmsg, sizeof(fmsg))) {
         json_set_bool(r, "failed", true);
@@ -260,6 +273,7 @@ static void stop_machine(server *s) {
             xlog("recording could not be finalised: %s", err);
         }
         s->rec = NULL;
+        s->rec_res_seq = 0;
     }
     if (s->machine) {
         emu_destroy(s->machine);
@@ -272,22 +286,51 @@ static void stop_machine(server *s) {
 }
 
 /* Called after anything that advances time.  Detects asynchronous encoder
- * death and reports it without breaking the emulator. */
+ * death, and reports a mid-recording screen-mode switch, without breaking the
+ * emulator. */
 static void check_recorder(server *s, json *data) {
     if (!s->rec) return;
     char msg[2048];
-    if (!recorder_failed(s->rec, msg, sizeof(msg))) return;
-    char path[X68K_PATH_MAX];
-    snprintf(path, sizeof(path), "%s", recorder_path(s->rec));
-    s->rec_path[0] = '\0';
-    if (s->machine) emu_set_recorder(s->machine, NULL);
-    char err[2048] = {0};
-    recorder_stop(s->rec, err, sizeof(err));
-    s->rec = NULL;
+    if (recorder_failed(s->rec, msg, sizeof(msg))) {
+        char path[X68K_PATH_MAX];
+        snprintf(path, sizeof(path), "%s", recorder_path(s->rec));
+        s->rec_path[0] = '\0';
+        if (s->machine) emu_set_recorder(s->machine, NULL);
+        char err[2048] = {0};
+        recorder_stop(s->rec, err, sizeof(err));
+        s->rec = NULL;
+        s->rec_res_seq = 0;
+        json *warn = json_object();
+        json_set_str(warn, "code", "recording_failed");
+        json_set_str(warn, "message", msg);
+        json_set_str(warn, "path", path);
+        json_set(data, "warning", warn);
+        return;
+    }
+
+    /* A mode switch changes the emulated screen size; the file keeps the size
+     * chosen at 'record start', so the new frames are rescaled.  Say so once
+     * per change instead of silently producing a resampled video. */
+    uint64_t seq = recorder_resolution_seq(s->rec);
+    if (seq == s->rec_res_seq) return;
+    s->rec_res_seq = seq;
+    unsigned fw = 0, fh = 0, tw = 0, th = 0;
+    if (!recorder_last_resolution_change(s->rec, &fw, &fh, &tw, &th)) return;
+    char from[32], to[32], out[32], text[320];
+    snprintf(from, sizeof(from), "%ux%u", fw, fh);
+    snprintf(to, sizeof(to), "%ux%u", tw, th);
+    snprintf(out, sizeof(out), "%ux%u", recorder_width(s->rec), recorder_height(s->rec));
+    snprintf(text, sizeof(text),
+             "the screen changed from %s to %s while recording; the 4:3 image is "
+             "resized into the fixed %s canvas", from, to, out);
     json *warn = json_object();
-    json_set_str(warn, "code", "recording_failed");
-    json_set_str(warn, "message", msg);
-    json_set_str(warn, "path", path);
+    json_set_str(warn, "code", "recording_resolution_changed");
+    json_set_str(warn, "message", text);
+    json_set_str(warn, "from", from);
+    json_set_str(warn, "to", to);
+    json_set_str(warn, "output", out);
+    json_set_str(warn, "hint",
+                 "no action needed: the canvas and 4:3 geometry stay fixed");
     json_set(data, "warning", warn);
 }
 
@@ -301,6 +344,9 @@ static int finalize_recording(server *s, json *data) {
     unsigned w = recorder_width(s->rec);
     unsigned h = recorder_height(s->rec);
     bool audio = recorder_has_audio(s->rec);
+    unsigned sw = recorder_source_width(s->rec);
+    unsigned sh = recorder_source_height(s->rec);
+    uint64_t res_changes = recorder_resolution_changes(s->rec);
     /* The recorder timeline is emulated time by construction (audio is
      * written at its native 44.1 kHz and video frames are emitted to match),
      * so video_seconds is also the recorded amount of emulated time.  Using
@@ -312,6 +358,7 @@ static int finalize_recording(server *s, json *data) {
     char err[2048] = {0};
     int rc = recorder_stop(s->rec, err, sizeof(err));
     s->rec = NULL;
+    s->rec_res_seq = 0;
     s->rec_path[0] = '\0';
 
     json *info = json_object();
@@ -321,6 +368,11 @@ static int finalize_recording(server *s, json *data) {
     json_set_double(info, "fps", fps);
     json_set_int(info, "width", w);
     json_set_int(info, "height", h);
+    if (sw && sh) {
+        json_set_int(info, "source_width", sw);
+        json_set_int(info, "source_height", sh);
+    }
+    json_set_int(info, "resolution_changes", (int64_t)res_changes);
     json_set_bool(info, "audio", audio);
     json_set_double(info, "video_seconds", out_seconds);
     json_set_double(info, "emu_seconds", emu_secs);
@@ -520,6 +572,134 @@ static char *default_record_path(server *s, const char *ext) {
         p = path_join(s->paths.recordings, name);
     }
     return p;
+}
+
+static char *default_dump_dir(server *s) {
+    uint64_t frame = s->has_machine ? emu_frame(s->machine) : 0;
+    char name[64];
+    snprintf(name, sizeof(name), "f%08llu", (unsigned long long)frame);
+    char *p = path_join(s->paths.dumps, name);
+    int n = 1;
+    while (path_exists(p)) {
+        free(p);
+        snprintf(name, sizeof(name), "f%08llu-%d", (unsigned long long)frame, n++);
+        p = path_join(s->paths.dumps, name);
+    }
+    return p;
+}
+
+static int write_file_bytes(const char *path, const void *data, size_t len,
+                            char *err, size_t errlen) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        snprintf(err, errlen, "cannot create %s: %s", path, strerror(errno));
+        return -1;
+    }
+    int rc = 0;
+    if (len && fwrite(data, 1, len, f) != len) rc = -1;
+    if (fclose(f) != 0) rc = -1;
+    if (rc != 0) {
+        unlink(path);
+        snprintf(err, errlen, "failed to write %s", path);
+        return -1;
+    }
+    return 0;
+}
+
+static int write_json_file(const char *path, json *v, char *err, size_t errlen) {
+    char *s = json_dump(v, true);
+    size_t len = strlen(s);
+    int rc = write_file_bytes(path, s, len, err, errlen);
+    free(s);
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* dump helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+static json *palette_map_obj(const emu_palette_map *m) {
+    json *o = json_object();
+    json_set_int(o, "entries", EMU_PALETTE_ENTRIES);
+    json *raw = json_array();
+    json *rgb565 = json_array();
+    json *rgb = json_array();
+    for (int i = 0; i < EMU_PALETTE_ENTRIES; i++) {
+        char hex[16];
+        snprintf(hex, sizeof(hex), "#%02x%02x%02x", m->rgb[i][0], m->rgb[i][1], m->rgb[i][2]);
+        json_add_int(raw, m->raw[i]);
+        json_add_int(rgb565, m->rgb565[i]);
+        json_add_str(rgb, hex);
+    }
+    json_set(o, "raw", raw);
+    json_set(o, "rgb565", rgb565);
+    json_set(o, "rgb", rgb);
+    return o;
+}
+
+static json *video_state_obj(const emu_video_state *v, const char *mode) {
+    json *o = json_object();
+    json_set_int(o, "chr_size", v->chr_size);
+    json_set_str(o, "screen_mode", mode);
+
+    json *bg = json_object();
+    json_set_int(bg, "chr_size", v->chr_size);
+    json *regs = json_array();
+    for (size_t i = 0; i < sizeof(v->bg_regs); i++) json_add_int(regs, v->bg_regs[i]);
+    json_set(bg, "regs", regs);
+    json *bg0 = json_object();
+    json_set_bool(bg0, "on", v->bg0_on);
+    json_set_int(bg0, "scroll_x", v->bg0_scroll_x);
+    json_set_int(bg0, "scroll_y", v->bg0_scroll_y);
+    json_set(bg, "bg0", bg0);
+    json *bg1 = json_object();
+    json_set_bool(bg1, "on", v->bg1_on);
+    json_set_int(bg1, "scroll_x", v->bg1_scroll_x);
+    json_set_int(bg1, "scroll_y", v->bg1_scroll_y);
+    json_set(bg, "bg1", bg1);
+    json_set(o, "bg", bg);
+
+    json *sprites = json_array();
+    for (int i = 0; i < v->sprite_count; i++) {
+        const emu_sprite_info *s = &v->sprites[i];
+        json *so = json_object();
+        json_set_int(so, "index", i);
+        json_set_int(so, "x", s->x);
+        json_set_int(so, "y", s->y);
+        json_set_int(so, "ctrl", s->ctrl);
+        json_set_int(so, "pattern", s->pattern);
+        json_set_int(so, "bank", s->bank);
+        json_set_int(so, "priority", s->priority);
+        json_add(sprites, so);
+    }
+    json_set(o, "sprites", sprites);
+
+    json *crtc = json_object();
+    json *cregs = json_array();
+    for (size_t i = 0; i < sizeof(v->crtc_regs); i++) json_add_int(cregs, v->crtc_regs[i]);
+    json_set(crtc, "regs", cregs);
+    json_set_int(crtc, "text_dot_x", v->text_dot_x);
+    json_set_int(crtc, "text_dot_y", v->text_dot_y);
+    json_set_int(crtc, "text_scroll_x", v->text_scroll_x);
+    json_set_int(crtc, "text_scroll_y", v->text_scroll_y);
+    json *vctrl = json_array();
+    for (int i = 0; i < 3; i++) {
+        json *a = json_array();
+        json_add_int(a, v->vc_regs[i][0]);
+        json_add_int(a, v->vc_regs[i][1]);
+        json_add(vctrl, a);
+    }
+    json_set(crtc, "vctrl", vctrl);
+    json *grph_scroll = json_array();
+    for (int i = 0; i < 4; i++) {
+        json *g = json_object();
+        json_set_int(g, "x", v->grph_scroll_x[i]);
+        json_set_int(g, "y", v->grph_scroll_y[i]);
+        json_add(grph_scroll, g);
+    }
+    json_set(crtc, "graphic_scroll", grph_scroll);
+    json_set(o, "crtc", crtc);
+    return o;
 }
 
 /* ------------------------------------------------------------------ */
@@ -868,6 +1048,209 @@ static json *cmd_snap(server *s, int argc, char **argv, const char *cmdname) {
     return resp;
 }
 
+/* Dump the expanded sprite/BG character patterns (PCG), both palettes and the
+ * video-controller state into a directory.  PCG is written as a PNG contact
+ * sheet plus a raw one-byte-per-pixel file; the palette and video state are
+ * JSON so an agent can inspect them without decoding images. */
+static json *cmd_dump(server *s, int argc, char **argv) {
+    json *resp = new_response("dump");
+    const char *out = NULL;
+    int scale = 1;
+    int bank = 0;
+    bool grid = false;
+
+    for (int i = 1; i < argc; i++) {
+        const char *v = NULL;
+        int m;
+        if (!strcmp(argv[i], "-o")) {
+            if (i + 1 >= argc) return usage_error(resp, "-o requires a directory", NULL), resp;
+            out = argv[++i];
+            continue;
+        }
+        if ((m = match_opt(argc, argv, &i, "--out", &v)) != 0) {
+            if (m < 0) return usage_error(resp, "-o/--out requires a directory", NULL), resp;
+            out = v;
+            continue;
+        }
+        if ((m = match_opt(argc, argv, &i, "--scale", &v)) != 0) {
+            if (m < 0) return usage_error(resp, "--scale requires a number", NULL), resp;
+            long long x;
+            if (!parse_int(v, &x) || x < 1 || x > 8)
+                return usage_error(resp, "--scale must be 1..8", NULL), resp;
+            scale = (int)x;
+            continue;
+        }
+        if ((m = match_opt(argc, argv, &i, "--bank", &v)) != 0) {
+            if (m < 0) return usage_error(resp, "--bank requires a palette bank", NULL), resp;
+            long long x;
+            if (!parse_int(v, &x) || x < 0 || x > 15)
+                return usage_error(resp, "--bank must be 0..15", NULL), resp;
+            bank = (int)x;
+            continue;
+        }
+        if (!strcmp(argv[i], "--grid")) {
+            grid = true;
+            continue;
+        }
+        if (argv[i][0] == '-') return usage_error(resp, "unknown option for dump", argv[i]), resp;
+        return usage_error(resp, "dump takes no positional arguments", NULL), resp;
+    }
+
+    if (!s->has_machine)
+        return cmd_error(resp, "not_booted", "no machine is running",
+                         "run 'x68k boot IMAGE ...' first"), resp;
+
+    char *dir = out ? path_absolute(out) : default_dump_dir(s);
+    if (path_exists(dir) && !path_is_dir(dir)) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "dump output is not a directory: %s", dir);
+        free(dir);
+        return cmd_error(resp, "dump_failed", msg, NULL), resp;
+    }
+    char err[1024] = {0};
+    if (mkdir_p(dir, 0755) != 0) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "cannot create dump directory %s: %s", dir, strerror(errno));
+        free(dir);
+        return cmd_error(resp, "dump_failed", msg, NULL), resp;
+    }
+
+    json *pcg = json_object();
+    json_set_int(pcg, "patterns", EMU_PCG_PATTERNS);
+    json_set_int(pcg, "columns", 16);
+    json_set_int(pcg, "bank", bank);
+    json_set_int(pcg, "scale", scale);
+    json_set_bool(pcg, "grid", grid);
+    json_set_str(pcg, "palette", "text");
+    json_set_str(pcg, "sprite_tile", "16x16");
+    const char *active = "8x8";
+
+    static const unsigned tiles[] = {EMU_PCG16_TILE, EMU_PCG8_TILE};
+    for (size_t ti = 0; ti < sizeof(tiles) / sizeof(tiles[0]); ti++) {
+        unsigned tile = tiles[ti];
+        const char *key = tile == EMU_PCG16_TILE ? "16x16" : "8x8";
+        emu_pcg_view view;
+        if (emu_get_pcg(s->machine, tile, &view) != 0) {
+            json_free(pcg);
+            free(dir);
+            return cmd_error(resp, "dump_failed", "PCG data is not available", NULL), resp;
+        }
+        if (view.active) active = key;
+
+        char png_path[X68K_PATH_MAX];
+        char bin_path[X68K_PATH_MAX];
+        snprintf(png_path, sizeof(png_path), "%s/pcg%u.png", dir, tile);
+        snprintf(bin_path, sizeof(bin_path), "%s/pcg%u.bin", dir, tile);
+
+        unsigned w = 0, h = 0;
+        size_t png_bytes = 0, bin_bytes = 0;
+        if (emu_write_pcg_bin(s->machine, tile, bin_path, &bin_bytes, err, sizeof(err)) != 0) {
+            char msg[1200];
+            snprintf(msg, sizeof(msg), "%s", err);
+            json_free(pcg);
+            free(dir);
+            return cmd_error(resp, "dump_failed", msg, NULL), resp;
+        }
+        if (emu_write_pcg_png(s->machine, tile, bank, scale, grid, png_path, &w, &h,
+                              &png_bytes, err, sizeof(err)) != 0) {
+            char msg[1200];
+            snprintf(msg, sizeof(msg), "%s", err);
+            json_free(pcg);
+            free(dir);
+            return cmd_error(resp, "dump_failed", msg, NULL), resp;
+        }
+
+        json *f = json_object();
+        json_set_str(f, "png", png_path);
+        json_set_str(f, "bin", bin_path);
+        json_set_int(f, "patterns", view.patterns);
+        json_set_int(f, "tile", view.tile);
+        json_set_int(f, "columns", 16);
+        json_set_int(f, "rows", 16);
+        json_set_int(f, "sheet_width", 16 * view.tile + (grid ? 15 : 0));
+        json_set_int(f, "sheet_height", 16 * view.tile + (grid ? 15 : 0));
+        json_set_int(f, "png_width", w);
+        json_set_int(f, "png_height", h);
+        json_set_int(f, "png_bytes", (int64_t)png_bytes);
+        json_set_int(f, "bin_bytes", (int64_t)bin_bytes);
+        json_set_bool(f, "active", view.active);
+        json_set_str(f, "layout", "pattern-major, 1 byte per pixel, values 0-15");
+        json_set(pcg, key, f);
+    }
+    json_set_str(pcg, "active", active);
+    json_set(resp_data(resp), "pcg", pcg);
+
+    emu_palette_map graphics, text;
+    emu_palette_snapshot(s->machine, &graphics, &text);
+    char pal_path[X68K_PATH_MAX];
+    char pal_bin_path[X68K_PATH_MAX];
+    snprintf(pal_path, sizeof(pal_path), "%s/palette.json", dir);
+    snprintf(pal_bin_path, sizeof(pal_bin_path), "%s/palette.bin", dir);
+    json *palette = json_object();
+    json_set(palette, "graphics", palette_map_obj(&graphics));
+    json_set(palette, "text", palette_map_obj(&text));
+    json_set_str(palette, "file", pal_path);
+    json_set_str(palette, "bin", pal_bin_path);
+    json_set_str(palette, "bin_layout",
+                 "1024 raw palette bytes: 256 graphics words, then 256 text words (big-endian)");
+
+    uint8_t palette_raw[1024];
+    for (int i = 0; i < EMU_PALETTE_ENTRIES; i++) {
+        palette_raw[i * 2] = (uint8_t)(graphics.raw[i] >> 8);
+        palette_raw[i * 2 + 1] = (uint8_t)(graphics.raw[i] & 0xff);
+        palette_raw[512 + i * 2] = (uint8_t)(text.raw[i] >> 8);
+        palette_raw[512 + i * 2 + 1] = (uint8_t)(text.raw[i] & 0xff);
+    }
+    if (write_file_bytes(pal_bin_path, palette_raw, sizeof(palette_raw), err, sizeof(err)) != 0) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "%s", err);
+        json_free(palette);
+        free(dir);
+        return cmd_error(resp, "dump_failed", msg, NULL), resp;
+    }
+    if (write_json_file(pal_path, palette, err, sizeof(err)) != 0) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "%s", err);
+        json_free(palette);
+        free(dir);
+        return cmd_error(resp, "dump_failed", msg, NULL), resp;
+    }
+    json_set(resp_data(resp), "palette", palette);
+
+    emu_video_state video;
+    emu_video_snapshot(s->machine, &video);
+    char video_path[X68K_PATH_MAX];
+    snprintf(video_path, sizeof(video_path), "%s/video.json", dir);
+    json *video_json = video_state_obj(&video, video_is_31k(s) ? "31k" : "15k");
+    json_set_str(video_json, "file", video_path);
+    if (write_json_file(video_path, video_json, err, sizeof(err)) != 0) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "%s", err);
+        json_free(video_json);
+        free(dir);
+        return cmd_error(resp, "dump_failed", msg, NULL), resp;
+    }
+    json_free(video_json);
+
+    json *data = resp_data(resp);
+    json_set_str(data, "dir", dir);
+    json_set_int(data, "frame", (int64_t)emu_frame(s->machine));
+    json_set_double(data, "emu_seconds", emu_seconds(s->machine));
+    json *vsum = json_object();
+    json_set_str(vsum, "file", video_path);
+    json_set_str(vsum, "screen_mode", video_is_31k(s) ? "31k" : "15k");
+    json_set_int(vsum, "chr_size", video.chr_size);
+    json_set_int(vsum, "sprites", video.sprite_count);
+    json_set_bool(vsum, "bg0_on", video.bg0_on);
+    json_set_bool(vsum, "bg1_on", video.bg1_on);
+    json_set(data, "video", vsum);
+    json_set_str(data, "note",
+                 "pcg16/pcg8 are pattern-major sheets; palette.json has raw and RGB entries");
+    free(dir);
+    set_ok(resp);
+    return resp;
+}
+
 static json *cmd_record(server *s, int argc, char **argv) {
     json *resp = new_response("record");
     if (argc < 2) return usage_error(resp, "record needs a subcommand", "record start | record stop | record status"), resp;
@@ -948,9 +1331,11 @@ static json *cmd_record(server *s, int argc, char **argv) {
             if (errno || !end || *end || fps < 1.0 || fps > 240.0)
                 return usage_error(resp, "--fps must be between 1 and 240", NULL), resp;
         }
-        unsigned w = 640, h = 480;
+        /* Fixed canvas: the emulated 4:3 image is resampled into it, so the
+         * geometry stays the same across video-mode switches. */
+        unsigned w = RECORD_DEFAULT_W, h = RECORD_DEFAULT_H;
         if (size_s && !parse_size_arg(size_s, &w, &h))
-            return usage_error(resp, "--size must be EVENxEVEN, e.g. 640x480", NULL), resp;
+            return usage_error(resp, "--size must be EVENxEVEN, e.g. 1600x1024", NULL), resp;
         char *path = out ? path_absolute(out) : default_record_path(s, ".mp4");
         char err[2048] = {0};
         recorder *r = recorder_start(path, fps, w, h, 44100, audio, err, sizeof(err));
@@ -961,6 +1346,7 @@ static json *cmd_record(server *s, int argc, char **argv) {
             return cmd_error(resp, "record_start_failed", msg, "check that ffmpeg is installed and the path is writable"), resp;
         }
         s->rec = r;
+        s->rec_res_seq = 0;
         snprintf(s->rec_path, sizeof(s->rec_path), "%s", path);
         s->rec_start_frame = emu_frame(s->machine);
         s->rec_start_seconds = emu_seconds(s->machine);
@@ -968,7 +1354,11 @@ static json *cmd_record(server *s, int argc, char **argv) {
         emu_set_recorder(s->machine, r);
         json *data = resp_data(resp);
         json_set(data, "recording", recording_obj(s));
-        json_set_str(data, "note", "frames are recorded only while 'step' advances emulated time");
+        char note[200];
+        snprintf(note, sizeof(note),
+                 "frames are recorded only while 'step' advances emulated time; "
+                 "the 4:3 image is scaled into a fixed %ux%u canvas", w, h);
+        json_set_str(data, "note", note);
         free(path);
         set_ok(resp);
         return resp;
@@ -1354,11 +1744,62 @@ static json *cmd_joy(server *s, int argc, char **argv) {
     return usage_error(resp, "unknown joy subcommand", "joy tap|down|up|hold"), resp;
 }
 
+static void add_step_result(emu_step_result *acc, const emu_step_result *st) {
+    acc->frames += st->frames;
+    acc->emu_seconds += st->emu_seconds;
+    acc->wall_ms += st->wall_ms;
+}
+
+static bool mouse_button_name_ok(const char *button) {
+    return !strcasecmp(button, "left") || !strcasecmp(button, "l") ||
+           !strcasecmp(button, "right") || !strcasecmp(button, "r");
+}
+
+static int mouse_click_once(server *s, const char *btn,
+                            double hold_sec, bool hold_frames, long long hold_nframes,
+                            emu_step_result *acc, char *err, size_t errlen) {
+    if (emu_mouse_button(s->machine, btn, true, err, errlen) != 0) return -1;
+    emu_step_result st;
+    memset(&st, 0, sizeof(st));
+    if (hold_frames ? hold_nframes > 0 : hold_sec > 0) {
+        if (step_hold(s, hold_sec, hold_frames, hold_nframes, &st) != 0) {
+            emu_mouse_button(s->machine, btn, false, err, errlen);
+            return -1;
+        }
+        add_step_result(acc, &st);
+    }
+    emu_mouse_button(s->machine, btn, false, err, errlen);
+    memset(&st, 0, sizeof(st));
+    if (emu_step_frames(s->machine, 1, &st, &g_stop) != 0) return -1;
+    add_step_result(acc, &st);
+    return 0;
+}
+
+/* A click should happen where the caller thinks the pointer is.  If a
+ * previous `mouse move --no-wait` is still queued, deliver it first. */
+static int mouse_flush_before_click(server *s, emu_step_result *acc, bool *had_move,
+                                    char *err, size_t errlen) {
+    int pdx = 0, pdy = 0;
+    emu_mouse_pending(s->machine, &pdx, &pdy);
+    if (had_move) *had_move = (pdx != 0 || pdy != 0);
+    if (pdx == 0 && pdy == 0) return 0;
+    emu_step_result st;
+    if (emu_mouse_flush(s->machine, &st, NULL, &g_stop) != 0) {
+        snprintf(err, errlen, "failed to deliver pending mouse movement");
+        return -1;
+    }
+    add_step_result(acc, &st);
+    return 0;
+}
+
 static json *cmd_mouse(server *s, int argc, char **argv) {
     json *resp = new_response("mouse");
-    if (argc < 2) return usage_error(resp, "mouse needs a subcommand", "mouse move|down|up|click ..."), resp;
+    if (argc < 2) return usage_error(resp, "mouse needs a subcommand",
+                                     "mouse move|down|up|click|doubleclick ..."), resp;
     const char *sub = argv[1];
     const char *hold_s = NULL;
+    const char *interval_s = NULL;
+    bool no_wait = false;
     const char *args[8];
     int nargs = 0;
     for (int i = 2; i < argc; i++) {
@@ -1368,6 +1809,11 @@ static json *cmd_mouse(server *s, int argc, char **argv) {
             if (m < 0) return usage_error(resp, "--hold requires a duration", NULL), resp;
             hold_s = v; continue;
         }
+        if ((m = match_opt(argc, argv, &i, "--interval", &v)) != 0) {
+            if (m < 0) return usage_error(resp, "--interval requires a duration", NULL), resp;
+            interval_s = v; continue;
+        }
+        if (!strcmp(argv[i], "--no-wait")) { no_wait = true; continue; }
         if (argv[i][0] == '-' && argv[i][1] == '-' && strcmp(argv[i], "-") != 0)
             return usage_error(resp, "unknown option for mouse", argv[i]), resp;
         if (nargs >= 8) return usage_error(resp, "too many arguments", NULL), resp;
@@ -1375,8 +1821,16 @@ static json *cmd_mouse(server *s, int argc, char **argv) {
     }
     if (!s->has_machine)
         return cmd_error(resp, "not_booted", "no machine is running", "run 'x68k boot IMAGE ...' first"), resp;
-    if (s->vgm) check_vgm(s, resp_data(resp));
-    if (s->rec) check_recorder(s, resp_data(resp));
+
+    bool is_single = !strcmp(sub, "click") || !strcmp(sub, "singleclick") ||
+                     !strcmp(sub, "single-click");
+    bool is_double = !strcmp(sub, "doubleclick") || !strcmp(sub, "double-click") ||
+                     !strcmp(sub, "dblclick");
+    if (no_wait && strcmp(sub, "move"))
+        return usage_error(resp, "--no-wait is only valid for 'mouse move'", NULL), resp;
+    if (interval_s && !is_double)
+        return usage_error(resp, "--interval is only valid for 'mouse doubleclick'", NULL), resp;
+
     char err[512] = {0};
     json *data = resp_data(resp);
 
@@ -1388,7 +1842,29 @@ static json *cmd_mouse(server *s, int argc, char **argv) {
             return cmd_error(resp, "input_failed", err, NULL), resp;
         json_set_int(data, "dx", dx);
         json_set_int(data, "dy", dy);
-        json_set_str(data, "note", "movement is delivered during the next step");
+        if (no_wait) {
+            json_set_bool(data, "delivered", false);
+            json_set_str(data, "note", "movement queued; delivered by the next step or click");
+        } else {
+            emu_step_result st;
+            bool delivered = false;
+            if (emu_mouse_flush(s->machine, &st, &delivered, &g_stop) != 0)
+                return cmd_error(resp, "input_failed", "failed to deliver mouse movement", NULL), resp;
+            int pdx = 0, pdy = 0;
+            emu_mouse_pending(s->machine, &pdx, &pdy);
+            json_set_int(data, "frames", (int64_t)st.frames);
+            json_set_double(data, "emu_seconds", st.emu_seconds);
+            json_set_bool(data, "delivered", delivered && pdx == 0 && pdy == 0);
+            if (pdx != 0 || pdy != 0) {
+                json_set_int(data, "pending_dx", pdx);
+                json_set_int(data, "pending_dy", pdy);
+                json_set_str(data, "note", "guest stopped polling; remaining movement dropped");
+            } else {
+                json_set_str(data, "note", "movement delivered");
+            }
+        }
+        if (s->vgm) check_vgm(s, data);
+        if (s->rec) check_recorder(s, data);
         set_ok(resp);
         return resp;
     }
@@ -1402,31 +1878,64 @@ static json *cmd_mouse(server *s, int argc, char **argv) {
         set_ok(resp);
         return resp;
     }
-    if (!strcmp(sub, "click")) {
+    if (is_single || is_double) {
         const char *btn = nargs >= 1 ? args[0] : "left";
+        if (nargs > 1)
+            return usage_error(resp, "too many arguments for mouse click", NULL), resp;
         double hold_sec = 0.1;
-        bool is_frames = false;
-        long long nframes = 0;
-        if (hold_s && !parse_duration(hold_s, &hold_sec, &is_frames, &nframes))
+        bool hold_frames = false;
+        long long hold_nframes = 0;
+        if (hold_s && !parse_duration(hold_s, &hold_sec, &hold_frames, &hold_nframes))
             return usage_error(resp, "invalid --hold duration", NULL), resp;
-        if (emu_mouse_button(s->machine, btn, true, err, sizeof(err)) != 0)
+        double interval_sec = 0.1;
+        bool interval_frames = false;
+        long long interval_nframes = 0;
+        if (interval_s && !parse_duration(interval_s, &interval_sec, &interval_frames, &interval_nframes))
+            return usage_error(resp, "invalid --interval duration", NULL), resp;
+        /* Validate the button before the flush advances time. */
+        if (!mouse_button_name_ok(btn))
+            return cmd_error(resp, "input_failed", "mouse button must be 'left' or 'right'", NULL), resp;
+
+        emu_step_result total;
+        memset(&total, 0, sizeof(total));
+        bool had_move = false;
+        if (mouse_flush_before_click(s, &total, &had_move, err, sizeof(err)) != 0)
             return cmd_error(resp, "input_failed", err, NULL), resp;
-        emu_step_result st;
-        memset(&st, 0, sizeof(st));
-        step_hold(s, hold_sec, is_frames, nframes, &st);
-        emu_mouse_button(s->machine, btn, false, err, sizeof(err));
-        emu_step_result st2;
-        memset(&st2, 0, sizeof(st2));
-        emu_step_frames(s->machine, 1, &st2, &g_stop);
+        int64_t move_frames = (int64_t)total.frames;
+
+        if (mouse_click_once(s, btn, hold_sec, hold_frames, hold_nframes, &total,
+                             err, sizeof(err)) != 0)
+            return cmd_error(resp, "input_failed", err, NULL), resp;
+
+        emu_step_result interval_st;
+        memset(&interval_st, 0, sizeof(interval_st));
+        if (is_double) {
+            if (interval_frames ? interval_nframes > 0 : interval_sec > 0) {
+                if (step_hold(s, interval_sec, interval_frames, interval_nframes, &interval_st) != 0)
+                    return cmd_error(resp, "input_failed", "failed to step double-click interval", NULL), resp;
+                add_step_result(&total, &interval_st);
+            }
+            if (mouse_click_once(s, btn, hold_sec, hold_frames, hold_nframes, &total,
+                                 err, sizeof(err)) != 0)
+                return cmd_error(resp, "input_failed", err, NULL), resp;
+        }
+
         json_set_str(data, "button", btn);
-        json_set_int(data, "frames", (int64_t)(st.frames + st2.frames));
-        json_set_double(data, "emu_seconds", st.emu_seconds + st2.emu_seconds);
+        json_set_int(data, "clicks", is_double ? 2 : 1);
+        json_set_int(data, "frames", (int64_t)total.frames);
+        json_set_double(data, "emu_seconds", total.emu_seconds);
+        if (had_move) json_set_int(data, "move_frames", move_frames);
+        if (is_double) {
+            json_set_int(data, "interval_frames", (int64_t)interval_st.frames);
+            json_set_double(data, "interval_ms", interval_st.emu_seconds * 1000.0);
+        }
         if (s->vgm) check_vgm(s, data);
         if (s->rec) check_recorder(s, data);
         set_ok(resp);
         return resp;
     }
-    return usage_error(resp, "unknown mouse subcommand", "mouse move|down|up|click"), resp;
+    return usage_error(resp, "unknown mouse subcommand",
+                       "mouse move|down|up|click|singleclick|doubleclick"), resp;
 }
 
 static json *cmd_disk(server *s, int argc, char **argv) {
@@ -1687,6 +2196,7 @@ static json *dispatch(server *s, int argc, char **argv) {
         return cmd_step(s, argc, argv, cmd);
     if (!strcmp(cmd, "snap") || !strcmp(cmd, "screenshot") || !strcmp(cmd, "snapshot") || !strcmp(cmd, "screen"))
         return cmd_snap(s, argc, argv, cmd);
+    if (!strcmp(cmd, "dump")) return cmd_dump(s, argc, argv);
     if (!strcmp(cmd, "record")) return cmd_record(s, argc, argv);
     if (!strcmp(cmd, "key")) return cmd_key(s, argc, argv);
     if (!strcmp(cmd, "joy") || !strcmp(cmd, "joystick")) return cmd_joy(s, argc, argv);

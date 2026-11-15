@@ -39,6 +39,35 @@ void Mouse_Init(void)
 {
 	if (Config.JoyOrMouse)
 		Mouse_StartCapture(1);
+	Mouse_Reset();
+}
+
+/*
+ *	Movement that has not been delivered to the guest yet.
+ */
+void Mouse_GetPending(int *dx, int *dy)
+{
+	if (dx)
+		*dx = (int)MouseDX;
+	if (dy)
+		*dy = (int)MouseDY;
+}
+
+void Mouse_ClearPending(void)
+{
+	MouseDX = MouseDY = 0;
+}
+
+/*
+ *	Clear movement and button state (reset, state load, ...).
+ */
+void Mouse_Reset(void)
+{
+	Mouse_ClearPending();
+	MouseStat = 0;
+	MouseSt = 0;
+	MouseX = 0;
+	MouseY = 0;
 }
 
 /*
@@ -83,35 +112,42 @@ void Mouse_SetData(void)
 		x = (int)MouseDX;
 		y = (int)MouseDY;
 
-		MouseDX = MouseDY = 0;
-
 		MouseSt = MouseStat;
 
+		/* Keep the part that does not fit into this SCC report.  The
+		 * guest polls the SCC less often than once per frame, so
+		 * dropping the overflow made large relative moves disappear. */
 		if (x > 127) {
 			MouseSt |= 0x10;
 			MouseX = 127;
-		} else if (x < -128)
-      {
+			MouseDX -= 127;
+		} else if (x < -128) {
 			MouseSt |= 0x20;
 			MouseX = -128;
-		}
-      else
+			MouseDX += 128;
+		} else {
 			MouseX = (int8_t)x;
+			MouseDX = 0;
+		}
 
 		if (y > 127) {
 			MouseSt |= 0x40;
 			MouseY = 127;
+			MouseDY -= 127;
 		} else if (y < -128) {
 			MouseSt |= 0x80;
 			MouseY = -128;
-		}
-      else
+			MouseDY += 128;
+		} else {
 			MouseY = (int8_t)y;
+			MouseDY = 0;
+		}
 
 	} else {
 		MouseSt = 0;
 		MouseX = 0;
 		MouseY = 0;
+		MouseDX = MouseDY = 0;
 	}
 }
 

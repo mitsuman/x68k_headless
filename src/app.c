@@ -48,6 +48,7 @@ void app_paths_init(app_paths *p, const char *override) {
     set_path(p->screens, sizeof(p->screens), p->home, "screens");
     set_path(p->recordings, sizeof(p->recordings), p->home, "recordings");
     set_path(p->states, sizeof(p->states), p->home, "states");
+    set_path(p->dumps, sizeof(p->dumps), p->home, "dumps");
     set_path(p->roms, sizeof(p->roms), p->home, "roms");
 }
 
@@ -58,7 +59,7 @@ int app_make_dirs(const app_paths *p, char *err, size_t errlen) {
                  p->sock);
         return -1;
     }
-    const char *dirs[] = {p->home, p->screens, p->recordings, p->states, p->roms};
+    const char *dirs[] = {p->home, p->screens, p->recordings, p->states, p->dumps, p->roms};
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         if (mkdir_p(dirs[i], i == 0 ? 0700 : 0755) != 0) {
             snprintf(err, errlen, "cannot create directory %s: %s", dirs[i], strerror(errno));

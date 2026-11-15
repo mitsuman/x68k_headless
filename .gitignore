@@ -6,3 +6,5 @@ compile_commands.json
 *.dylib
 *.so
 testhome/
+# Local SX-Window disks/screenshots (freeware, not for redistribution here)
+sxwindow/

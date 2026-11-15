@@ -33,4 +33,20 @@ unsigned    recorder_height(const recorder *r);
 bool        recorder_has_audio(const recorder *r);
 const char *recorder_path(const recorder *r);
 
+/* Size of the most recent emulated frame.  The output size is fixed when the
+ * recording starts, so this differs from width/height once the X68000 changes
+ * video mode: frames are then rescaled into the original output size. */
+unsigned    recorder_source_width(const recorder *r);
+unsigned    recorder_source_height(const recorder *r);
+
+/* Number of mid-recording screen-resolution changes, and a counter that
+ * increments per change so a caller can report each one exactly once. */
+uint64_t    recorder_resolution_changes(const recorder *r);
+uint64_t    recorder_resolution_seq(const recorder *r);
+
+/* Details of the most recent change.  false when nothing changed yet. */
+bool        recorder_last_resolution_change(const recorder *r, unsigned *from_w,
+                                            unsigned *from_h, unsigned *to_w,
+                                            unsigned *to_h);
+
 #endif
