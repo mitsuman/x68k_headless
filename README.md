@@ -1,5 +1,7 @@
 # x68k — headless X68000 emulator for scripted / LLM play
 
+[![Build](https://github.com/mitsuman/x68k_headless/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/mitsuman/x68k_headless/actions/workflows/build.yml)
+
 `x68k` runs a Sharp X68000 with **no window, no real-time pacing and no GUI**. It
 is a small CLI/daemon built around the [px68k libretro
 core](https://github.com/libretro/px68k-libretro): you boot a machine, advance
@@ -91,6 +93,11 @@ cmake --build build -j
 
 or simply `make` (a thin CMake wrapper). Install with `cmake --install build`
 (installs `bin/x68k`).
+
+The `Build` GitHub Actions workflow configures, builds and smoke-checks the
+binary on both Linux (`ubuntu-latest`) and macOS (`macos-latest`) for every push
+and pull request. The badge at the top of this file shows the latest `main`
+result.
 
 ## Quick start
 

@@ -94,8 +94,10 @@ target_compile_options(px68k_core PRIVATE
 )
 
 # The vendored core is C89-ish and contains SJIS string literals we do not want
-# clang to complain about.
-set_source_files_properties(${PX68K_DIR}/libretro.c PROPERTIES COMPILE_OPTIONS "-Wno-invalid-source-encoding")
+# clang to complain about.  GCC does not know this flag, so only add it there.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+  set_source_files_properties(${PX68K_DIR}/libretro.c PROPERTIES COMPILE_OPTIONS "-Wno-invalid-source-encoding")
+endif()
 
 add_executable(x68k
   src/main.c
